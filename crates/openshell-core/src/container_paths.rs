@@ -51,9 +51,10 @@ pub const POLICY_ADVISOR_SKILL_PATH: &str = "/etc/openshell/skills/policy_adviso
 
 pub const SSH_SOCKET_PATH: &str = "/run/openshell/ssh.sock";
 /// Directory where in-sandbox Policy Information Point publishers create
-/// their `<name>.sock` Unix domain sockets (RFC 0019). The supervisor creates
-/// it with mode 0750 before launching the workload and watches it for
-/// supervisor-initiated PIP streams.
+/// their `<name>.sock` Unix domain sockets (RFC 0019).
+///
+/// The supervisor creates it with mode 0750 before launching the workload
+/// and watches it for supervisor-initiated PIP streams.
 pub const PIP_SOCKET_DIR: &str = "/run/openshell/pip";
 pub const SIDECAR_CONTROL_SOCKET: &str = "/run/openshell-sidecar/control.sock";
 pub const SIDECAR_TLS_DIR: &str = "/etc/openshell-tls/proxy";
