@@ -54,6 +54,37 @@ The rule allows these four combinations:
 If `wget` should reach only `api.example.com`, put that binary and endpoint in a
 separate rule.
 
+### Policy Information Point Deny Conditions
+
+A rule can also carry `pip_deny_rules`: conditions on security context
+published at runtime by a Policy Information Point (PIP). Each condition names
+a published property `key` and a `equals` value. When a publisher reports a
+matching value, connections the rule would otherwise allow are denied.
+
+```yaml
+network_policies:
+  example_api:
+    endpoints:
+      - host: api.example.com
+        port: 443
+    binaries:
+      - path: /usr/bin/curl
+    pip_deny_rules:
+      - key: trust_state
+        equals: suspended
+      - key: data_classification
+        equals: phi
+```
+
+With this rule, a governance framework that has detected a compromise
+(`trust_state: suspended`) or absorbed sensitive data
+(`data_classification: phi`) stops the sandbox's egress through this rule, even
+though the endpoints and binaries still match. Published context can only deny;
+it never allows a connection the rule would not already allow, and when no
+publisher is connected the conditions are inert. See
+[Policy Information Point Publishers](/how-it-works/gateways/configuration#policy-information-point-publishers)
+for how publishers are registered and discovered.
+
 ### Binary Matching
 
 When you write a network rule, list the path of the executable that opens the

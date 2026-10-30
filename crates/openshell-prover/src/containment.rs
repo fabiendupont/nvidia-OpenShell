@@ -2905,6 +2905,7 @@ network_policies:
         policy.network_policies.insert(
             "mixed".to_owned(),
             NetworkRule {
+                pip_deny_rules: Vec::new(),
                 name: String::new(),
                 endpoints,
                 binaries: Vec::new(),
@@ -2938,6 +2939,7 @@ network_policies:
         policy.network_policies.insert(
             "l4".to_owned(),
             NetworkRule {
+                pip_deny_rules: Vec::new(),
                 name: String::new(),
                 endpoints,
                 binaries: Vec::new(),
@@ -3150,6 +3152,7 @@ network_policies:
             candidate.network_policies.insert(
                 format!("rule-{index}"),
                 NetworkRule {
+                    pip_deny_rules: Vec::new(),
                     name: String::new(),
                     endpoints: Vec::new(),
                     binaries: Vec::new(),

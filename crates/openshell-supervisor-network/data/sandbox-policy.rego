@@ -18,15 +18,22 @@ process_policy := data.process
 # --- Policy Information Point (PIP) runtime context ---
 #
 # input.pip carries the merged security-context properties published by
-# PIP-capable governance applications inside the sandbox (RFC 0019). The
-# supervisor verifies the publisher's binary identity and injects the cached
-# context here. PIP context can only restrict network access: these rules
-# deny otherwise-allowed connections and can never expand the allowlist.
-# When no PIP is connected, input.pip is undefined and every rule below is
-# inert, matching pre-PIP behavior.
+# PIP-capable governance software, inside the sandbox or operator-side
+# (RFC 0019). The supervisor verifies in-sandbox publisher identity and
+# injects the cached context here. PIP context is deny-only and
+# policy-authored: a network policy declares pip_deny_rules, and a connection
+# that policy would otherwise allow is denied when a published property has
+# the declared value. PIP context can never expand the allowlist. When no
+# PIP is connected, input.pip is undefined, every rule below is inert, and
+# baseline policy applies unchanged.
 
 pip_denies_network if {
-	input.pip.trust_state == "suspended"
+	some name
+	policy := data.network_policies[name]
+	endpoint_allowed(policy, input.network)
+	binary_allowed(policy, input.exec)
+	rule := object.get(policy, "pip_deny_rules", [])[_]
+	input.pip[rule.key] == rule.equals
 }
 
 allow_network if {
@@ -76,7 +83,7 @@ deny_reason := reason if {
 	reason := concat("; ", binary_misses)
 }
 
-deny_reason := "network connections denied by policy information point context (pip trust_state suspended)" if {
+deny_reason := "network connections denied by policy information point context" if {
 	input.network
 	input.exec
 	network_policy_for_request

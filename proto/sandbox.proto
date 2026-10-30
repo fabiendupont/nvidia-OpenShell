@@ -67,6 +67,19 @@ message NetworkPolicyRule {
   repeated NetworkEndpoint endpoints = 2;
   // Allowed binary identities.
   repeated NetworkBinary binaries = 3;
+  // Policy Information Point (PIP) deny conditions (RFC 0019). A connection
+  // this policy would otherwise allow is denied when a published input.pip
+  // property matches. Deny-only: PIP context can never expand the allowlist.
+  repeated PipDenyRule pip_deny_rules = 4;
+}
+
+// One PIP deny condition on a network policy rule: the connection is denied
+// when the published property `key` equals `equals`.
+message PipDenyRule {
+  // Published property key (for example "trust_state").
+  string key = 1;
+  // Required property value for the deny to fire (for example "suspended").
+  string equals = 2;
 }
 
 // A reusable middleware config selected for admitted egress by host.
@@ -429,6 +442,10 @@ message SandboxConfigSnapshot {
   uint64 settings_revision = 17;
   // Explicit application ingress allowlist. Absent means no app routes.
   repeated SandboxServiceRoute service_routes = 18;
+  // Operator-registered remote Policy Information Point publishers
+  // (RFC 0019). Configuration is the authorization: the supervisor connects
+  // only to endpoints on this list.
+  repeated SupervisorPipService supervisor_pip_services = 19;
 }
 
 // Response containing effective sandbox settings and policy, projected from
@@ -480,6 +497,10 @@ message GetSandboxConfigResponse {
   // Monotonic revision of the sandbox-scoped settings row.
   uint64 settings_revision = 17;
   repeated SandboxServiceRoute service_routes = 18;
+  // Operator-registered remote Policy Information Point publishers
+  // (RFC 0019). Configuration is the authorization: the supervisor connects
+  // only to endpoints on this list.
+  repeated SupervisorPipService supervisor_pip_services = 19;
 }
 
 // Gateway-declared service installed by a supervisor; this does not grant
@@ -490,6 +511,22 @@ message SandboxServiceRoute {
   uint32 target_port = 3;
   int32 authorization_mode = 4;
   uint64 resource_version = 5;
+}
+
+// Connection details for one operator-registered remote Policy Information
+// Point publisher (RFC 0019). Registration is the configuration-time
+// authorization: the supervisor initiates StreamContext only to endpoints on
+// this list and merges published context into input.pip under deny-only
+// policy semantics.
+message SupervisorPipService {
+  // Operator-owned registration name used for diagnostics and OCSF origin
+  // attribution.
+  string name = 1;
+  // gRPC endpoint reachable from the sandbox supervisor.
+  string grpc_endpoint = 2;
+  // PEM-encoded trust roots loaded by the gateway from the operator-configured
+  // tls_ca_cert_path. Empty uses the platform trust store.
+  bytes tls_ca_cert_pem = 3;
 }
 
 // Connection details for one operator-registered supervisor middleware service.

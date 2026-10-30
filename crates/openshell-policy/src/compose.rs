@@ -99,6 +99,7 @@ mod tests {
 
     fn rule(name: &str, host: &str) -> NetworkPolicyRule {
         NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: name.to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: host.to_string(),

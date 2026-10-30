@@ -738,6 +738,8 @@ async fn preauthorize_transparent_open(
                 &binary_identity,
                 "sandbox-local policy API requires port 80 and an active context",
                 "transparent_tcp_policy_local_invalid_destination",
+                None,
+                false,
             );
             let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
             return None;
@@ -762,6 +764,8 @@ async fn preauthorize_transparent_open(
                 &binary_identity,
                 "sandbox-local policy API requires a verified workload identity",
                 "transparent_tcp_policy_local_identity_unavailable",
+                None,
+                false,
             );
             let _ = completion.send(TcpOpenDecision::Denied(denial));
             return None;
@@ -791,6 +795,8 @@ async fn preauthorize_transparent_open(
                     &binary_identity,
                     &error.to_string(),
                     "transparent_tcp_mapping_denied",
+                    None,
+                    false,
                 );
                 let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
                 return None;
@@ -829,6 +835,8 @@ async fn preauthorize_transparent_open(
             &binary_identity,
             reason,
             status_detail,
+            decision.pip.as_ref(),
+            decision.pip_influenced,
         );
         if supplied_authorization.denial.is_none()
             && !is_always_blocked_ip(destination.ip())
@@ -857,6 +865,8 @@ async fn preauthorize_transparent_open(
             &binary_identity,
             &denial.reason,
             "transparent_tcp_destination_denied",
+            None,
+            false,
         );
         let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
         return None;
@@ -895,6 +905,8 @@ async fn preauthorize_transparent_open(
                     &binary_identity,
                     &reason,
                     status_detail,
+                    None,
+                    false,
                 );
                 let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
                 return None;
@@ -927,6 +939,8 @@ async fn preauthorize_transparent_open(
                 &binary_identity,
                 &denial.reason,
                 "transparent_tcp_destination_denied",
+                None,
+                false,
             );
             let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
             return None;
@@ -953,6 +967,8 @@ fn emit_staged_transparent_denial(
     identity: &Result<ContractBinaryIdentity, ResolveError>,
     reason: &str,
     status_detail: &'static str,
+    pip: Option<&crate::pip::PipSnapshot>,
+    pip_influenced: bool,
 ) {
     egress_emit!(build_staged_transparent_denial_event(
         destination,
@@ -960,15 +976,20 @@ fn emit_staged_transparent_denial(
         identity,
         reason,
         status_detail,
+        pip,
+        pip_influenced,
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_staged_transparent_denial_event(
     destination: SocketAddr,
     mapped_host: Option<&str>,
     identity: &Result<ContractBinaryIdentity, ResolveError>,
     reason: &str,
     status_detail: &'static str,
+    pip: Option<&crate::pip::PipSnapshot>,
+    pip_influenced: bool,
 ) -> openshell_ocsf::OcsfEvent {
     let (binary, ancestors, cmdline) = identity.as_ref().map_or_else(
         |_| ("-".to_string(), "-".to_string(), "-".to_string()),
@@ -990,7 +1011,7 @@ fn build_staged_transparent_denial_event(
             )
         },
     );
-    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    let builder = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Open)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
@@ -999,8 +1020,23 @@ fn build_staged_transparent_denial_event(
         .dst_endpoint(transparent_destination_endpoint(destination, mapped_host))
         .actor_process(Process::from_bypass(&binary, "-", &ancestors).with_cmd_line(&cmdline))
         .message(format!("Transparent TCP denied before relay: {reason}"))
-        .status_detail(status_detail)
-        .build()
+        .status_detail(status_detail);
+    let pip_decision = EgressDecision {
+        intent: EgressIntent::connect(String::new(), 0),
+        action: NetworkAction::Deny {
+            reason: reason.to_string(),
+        },
+        policy_generation: 0,
+        identity: ProcessIdentityEvidence::Available,
+        endpoint: EndpointDecision::default(),
+        binary: None,
+        binary_pid: None,
+        ancestors: vec![],
+        cmdline_paths: vec![],
+        pip: pip.cloned(),
+        pip_influenced,
+    };
+    with_pip_denial_tags(builder, &pip_decision).build()
 }
 
 /// Name the policy DNS host an operator recognizes while keeping the
@@ -1602,7 +1638,7 @@ fn emit_transparent_policy_denial(
     let pid = decision
         .binary_pid
         .map_or_else(|| "-".to_string(), |pid| pid.to_string());
-    let mut builder = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    let builder = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Open)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
@@ -1614,35 +1650,43 @@ fn emit_transparent_policy_denial(
         .firewall_rule("-", "opa")
         .message(format!("Transparent TCP denied {host}:{port}"))
         .status_detail(status_detail);
-    // Tag PIP-influenced denials with the published context and each
-    // publisher's origin so analysts can weight in-sandbox-sourced evidence
-    // accordingly (RFC 0019).
-    if decision.pip_influenced
-        && let Some(pip) = &decision.pip
-    {
-        let origins: Vec<&str> = pip
-            .publishers
-            .iter()
-            .map(|(_, origin)| origin.as_str())
-            .collect();
-        builder = builder
-            .unmapped("pip_influenced", serde_json::json!(true))
-            .unmapped(
-                "pip_publishers",
-                serde_json::json!(
-                    pip.publishers
-                        .iter()
-                        .map(|(name, origin)| (name, origin.as_str()))
-                        .collect::<Vec<_>>()
-                ),
-            )
-            .unmapped("pip_origins", serde_json::json!(origins))
-            .unmapped(
-                "pip_context",
-                serde_json::Value::Object(pip.properties.clone()),
-            );
+    ocsf_emit!(with_pip_denial_tags(builder, decision).build());
+}
+
+/// Tag a network denial event with the published PIP context and each
+/// publisher's origin when the PIP deny rule fired, so analysts can weight
+/// in-sandbox-sourced evidence accordingly (RFC 0019).
+fn with_pip_denial_tags<'a, EndpointState>(
+    builder: NetworkActivityBuilder<'a, EndpointState>,
+    decision: &EgressDecision,
+) -> NetworkActivityBuilder<'a, EndpointState> {
+    if !decision.pip_influenced {
+        return builder;
     }
-    egress_emit!(builder.build());
+    let Some(pip) = &decision.pip else {
+        return builder;
+    };
+    let origins: Vec<&str> = pip
+        .publishers
+        .iter()
+        .map(|(_, origin)| origin.as_str())
+        .collect();
+    builder
+        .unmapped("pip_influenced", serde_json::json!(true))
+        .unmapped(
+            "pip_publishers",
+            serde_json::json!(
+                pip.publishers
+                    .iter()
+                    .map(|(name, origin)| (name, origin.as_str()))
+                    .collect::<Vec<_>>()
+            ),
+        )
+        .unmapped("pip_origins", serde_json::json!(origins))
+        .unmapped(
+            "pip_context",
+            serde_json::Value::Object(pip.properties.clone()),
+        )
 }
 
 const MAX_CONSECUTIVE_UNKNOWN_ACCEPT_ERRORS: u32 = 10;
@@ -2914,22 +2958,25 @@ async fn handle_mediated_connection(
     // Allowed connections are logged after the L7 config check (below)
     // so we can distinguish CONNECT (L4-only) from CONNECT_L7 (L7 follows).
     if matches!(decision.action, NetworkAction::Deny { .. }) {
-        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Open)
-            .action(ActionId::Denied)
-            .disposition(DispositionId::Blocked)
-            .severity(SeverityId::Medium)
-            .status(StatusId::Failure)
-            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-            .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
-            )
-            .firewall_rule("-", "opa")
-            .message(format!("CONNECT denied {host_lc}:{port}"))
-            .status_detail(&deny_reason)
-            .build();
+        let event = with_pip_denial_tags(
+            NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Open)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
+                .actor_process(
+                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                        .with_cmd_line(&cmdline_str),
+                )
+                .firewall_rule("-", "opa")
+                .message(format!("CONNECT denied {host_lc}:{port}"))
+                .status_detail(&deny_reason),
+            &decision,
+        )
+        .build();
         egress_emit!(event);
         emit_denial(
             &denial_tx,
@@ -8531,6 +8578,8 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
             &open.binary_identity,
             "endpoint blocked.invalid:80 is not allowed by any policy",
             "transparent_tcp_policy_denied",
+            None,
+            false,
         );
         assert_eq!(
             mapped.format_shorthand(),
@@ -8550,6 +8599,8 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
             &open.binary_identity,
             "endpoint 203.0.113.7:443 is not allowed by any policy",
             "transparent_tcp_policy_denied",
+            None,
+            false,
         );
         assert_eq!(
             serde_json::to_value(unmapped).unwrap()["dst_endpoint"],

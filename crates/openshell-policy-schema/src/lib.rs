@@ -245,6 +245,23 @@ pub struct NetworkPolicyRule {
     pub endpoints: Vec<NetworkEndpoint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub binaries: Vec<NetworkBinary>,
+    /// Policy Information Point (PIP) deny conditions (RFC 0019). A
+    /// connection this policy would otherwise allow is denied when a
+    /// published `input.pip` property matches. Deny-only: PIP context can
+    /// never expand the allowlist.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pip_deny_rules: Vec<PipDenyRule>,
+}
+
+/// One PIP deny condition: the connection is denied when the published
+/// property `key` equals `equals`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PipDenyRule {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub equals: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -621,6 +638,7 @@ pub fn parse_policy_with_limits(source: &str, limits: ParseLimits) -> Result<Pol
             "network_policies.*.endpoints.*.deny_rules.*",
             "network_policies.*.endpoints.*.deny_rules.*.query",
             "network_policies.*.endpoints.*.deny_rules.*.params",
+            "network_policies.*.pip_deny_rules.*",
         ],
     )
     .into_diagnostic()
@@ -762,7 +780,11 @@ fn inspect_document(root: &serde_yml::Value) -> InspectionResult {
 
     for (name, rule) in open_map(root.get("network_policies")) {
         let path = join("network_policies", name);
-        if let Some(rule) = inspect_closed(rule, &path, &["name", "endpoints", "binaries"])? {
+        if let Some(rule) = inspect_closed(
+            rule,
+            &path,
+            &["name", "endpoints", "binaries", "pip_deny_rules"],
+        )? {
             for (index, endpoint) in sequence(rule.get("endpoints")).iter().enumerate() {
                 inspect_endpoint(endpoint, &join(&path, &format!("endpoints[{index}]")))?;
             }
@@ -771,6 +793,13 @@ fn inspect_document(root: &serde_yml::Value) -> InspectionResult {
                     binary,
                     &join(&path, &format!("binaries[{index}]")),
                     &["path"],
+                )?;
+            }
+            for (index, pip_rule) in sequence(rule.get("pip_deny_rules")).iter().enumerate() {
+                inspect_closed(
+                    pip_rule,
+                    &join(&path, &format!("pip_deny_rules[{index}]")),
+                    &["key", "equals"],
                 )?;
             }
         }

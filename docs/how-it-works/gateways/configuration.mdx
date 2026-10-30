@@ -342,6 +342,13 @@ audience = "urn:openshell:middleware:local-content-guard"
 max_payload_bytes = 262144
 timeout = "500ms"
 
+# Remote Policy Information Point publishers. Registration is the
+# authorization: supervisors connect only to endpoints on this list.
+[[openshell.supervisor.pip]]
+name = "navra"
+grpc_endpoint = "https://navra.internal:50051"
+tls_ca_cert_path = "/etc/openshell/certs/navra-ca.pem"
+
 # Gateway listener TLS (distinct from the supervisor gateway CA).
 # client_ca_path is optional; omit it for HTTPS-only listeners that do not
 # verify client certificates.
@@ -942,6 +949,21 @@ The service `grpc_endpoint` supports plaintext `http://` and TLS `https://`. HTT
 When `gateway_jwt` is configured, OpenShell attaches short-lived bearer credentials to gateway and supervisor calls and requires `https://`. A middleware endpoint must be reachable from sandbox supervisors, so Unix sockets are not an option here. Set `allow_insecure_transport = true` on a registration to keep a plaintext `http://` endpoint: OpenShell then attaches no credential, supervisors do not request one, and the gateway logs a warning naming the registration at every startup. mTLS client authentication, health checks, and runtime registration are not currently supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address that can be resolved in both places.
 
 See [Supervisor Middleware Configuration](/extensibility/supervisor-middleware/configure) for attachment, failure, and operational guidance.
+
+## Policy Information Point Publishers
+
+Register remote Policy Information Point (PIP) publishers with one or more `[[openshell.supervisor.pip]]` entries. A publisher is governance infrastructure, deployed by the operator outside the sandbox, that streams per-sandbox security context (data classification, trust state) to sandbox supervisors. The supervisor merges published context into policy evaluation as `input.pip`; sandbox policies can then deny otherwise-allowed connections with `pip_deny_rules`. Published context can only add deny constraints — it never expands a sandbox's allowlist, and a disconnected or absent publisher leaves policy behavior unchanged.
+
+```toml
+[[openshell.supervisor.pip]]
+name = "navra"
+grpc_endpoint = "https://navra.internal:50051"
+tls_ca_cert_path = "/etc/openshell/certs/navra-ca.pem"
+```
+
+Registration is static and operator-owned; changing it requires restarting the gateway. Registration is also the authorization: the supervisor initiates a `StreamContext` stream only to endpoints on the configured list and maps each stream to its sandbox by the sandbox id carried in the request. The `grpc_endpoint` supports plaintext `http://` and TLS `https://`; HTTPS uses the platform trust store unless `tls_ca_cert_path` names a certificate-only PEM bundle. Publishers on the same host as the supervisors can instead serve a Unix domain socket under `/run/openshell-supervisor/pip/<sandbox-id>/` with no gateway registration.
+
+Governance frameworks running inside a sandbox can publish the same way from `/run/openshell/pip/<name>.sock` without any configuration; the supervisor verifies the serving binary's identity before connecting.
 
 ## Gateway Interceptors
 

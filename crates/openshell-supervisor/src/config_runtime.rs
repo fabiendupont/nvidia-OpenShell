@@ -176,6 +176,7 @@ struct ConfigRuntime {
     policy_generation: Option<PolicyGenerationGuard>,
     endpoint_policy: Option<openshell_core::proto::SandboxPolicy>,
     middleware_services: Vec<openshell_core::proto::SupervisorMiddlewareService>,
+    pip_services: Vec<openshell_core::proto::SupervisorPipService>,
     extension_authentication_enabled: bool,
     middleware_registry_status: MiddlewareRegistryStatus,
     settings: std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
@@ -199,6 +200,7 @@ impl ConfigRuntime {
             policy_generation: None,
             endpoint_policy: ctx.endpoint_policy.clone(),
             middleware_services: Vec::new(),
+            pip_services: ctx.opa_engine.pip_remote_services(),
             extension_authentication_enabled: ctx.extension_authentication_enabled,
             middleware_registry_status: ctx.middleware_registry_status,
             settings: std::collections::HashMap::new(),
@@ -550,6 +552,16 @@ impl ConfigRuntime {
                     self.endpoint_policy.clone_from(&result.policy);
                     self.middleware_services
                         .clone_from(&result.supervisor_middleware_services);
+                    // Operator-registered remote PIP publishers (RFC 0019)
+                    // are configuration, not policy: reconcile them on every
+                    // admitted snapshot so registration changes take effect
+                    // without a policy hash change.
+                    if self.pip_services != result.supervisor_pip_services {
+                        ctx.opa_engine
+                            .replace_pip_services(result.supervisor_pip_services.clone());
+                        self.pip_services
+                            .clone_from(&result.supervisor_pip_services);
+                    }
                     self.extension_authentication_enabled = result.extension_authentication_enabled;
                     retain_extension_credentials(
                         &ctx.extension_credentials,

@@ -194,11 +194,19 @@ pub struct PipWatcherConfig {
     /// Root of the supervisor-side directory tree for same-host operator
     /// publishers.
     pub host_dir_root: PathBuf,
-    /// Operator-configured remote publisher gRPC endpoints. Configuring the
-    /// list authorizes those publishers.
+    /// Operator-configured remote publisher gRPC endpoints (environment
+    /// configuration for the standalone proxy role). Gateway-registered
+    /// publishers arrive through the OPA engine instead.
     pub remote_endpoints: Vec<String>,
     /// Optional PEM CA certificate path for `https://` remote endpoints.
     pub remote_ca_cert: Option<PathBuf>,
+}
+
+/// One remote publisher endpoint with its optional PEM trust roots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemotePipEndpoint {
+    pub endpoint: String,
+    pub ca_pem: Option<Vec<u8>>,
 }
 
 impl Default for PipWatcherConfig {
@@ -259,6 +267,24 @@ pub async fn run_pip_watcher(
     .await;
 }
 
+/// [`run_pip_watcher`] with the OPA engine's gateway-registered remote
+/// publishers merged into the environment-configured endpoint set.
+///
+/// Gateway registrations (`[[openshell.supervisor.pip]]` in `gateway.toml`,
+/// delivered in the sandbox configuration snapshot) and environment
+/// endpoints are unioned; the manager reconnects whenever the gateway
+/// registration set changes.
+pub async fn run_pip_watcher_with_engine(
+    cache: Arc<PipCache>,
+    entrypoint_pid: Arc<AtomicU32>,
+    sandbox_id: String,
+    engine: Arc<crate::opa::OpaEngine>,
+) {
+    let config = PipWatcherConfig::from_env();
+    run_pip_watcher_with_config_and_engine(cache, entrypoint_pid, sandbox_id, config, Some(engine))
+        .await;
+}
+
 /// [`run_pip_watcher`] with explicit operator configuration (tests, embedded
 /// callers).
 #[allow(clippy::unused_async)] // spawns detached tasks; kept async for a uniform spawn surface
@@ -267,6 +293,17 @@ pub async fn run_pip_watcher_with_config(
     entrypoint_pid: Arc<AtomicU32>,
     sandbox_id: String,
     config: PipWatcherConfig,
+) {
+    run_pip_watcher_with_config_and_engine(cache, entrypoint_pid, sandbox_id, config, None).await;
+}
+
+#[allow(clippy::unused_async)] // spawns detached tasks; kept async for a uniform spawn surface
+async fn run_pip_watcher_with_config_and_engine(
+    cache: Arc<PipCache>,
+    entrypoint_pid: Arc<AtomicU32>,
+    sandbox_id: String,
+    config: PipWatcherConfig,
+    engine: Option<Arc<crate::opa::OpaEngine>>,
 ) {
     // In-sandbox publishers need the workload's mount namespace; wait for
     // the entrypoint PID in a child task so operator-side publishers start
@@ -310,18 +347,113 @@ pub async fn run_pip_watcher_with_config(
         }
     }
 
-    // Remote operator publishers: authorized at configuration time.
-    for endpoint in config.remote_endpoints {
-        tracing::info!(
-            endpoint = %endpoint,
-            "PIP watcher: connecting to remote policy information point"
-        );
-        tokio::spawn(run_remote_pip_connection(
-            Arc::clone(&cache),
-            sandbox_id.clone(),
-            endpoint,
-            config.remote_ca_cert.clone(),
-        ));
+    // Remote operator publishers: authorized at configuration time (the
+    // configured endpoint list) and, for gateway-registered publishers, at
+    // gateway configuration time. Environment endpoints seed the set; the
+    // engine watcher unions in gateway registrations and reconnects on
+    // reconciliation changes.
+    let manager = Arc::new(RemotePipManager::new(Arc::clone(&cache), sandbox_id));
+    let env_ca_pem = config
+        .remote_ca_cert
+        .as_ref()
+        .and_then(|path| std::fs::read(path).ok());
+    let env_endpoints: Vec<RemotePipEndpoint> = config
+        .remote_endpoints
+        .iter()
+        .map(|endpoint| RemotePipEndpoint {
+            endpoint: endpoint.clone(),
+            ca_pem: env_ca_pem.clone(),
+        })
+        .collect();
+    if let Some(engine) = engine {
+        let watcher_engine = engine;
+        let watcher_manager = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let mut generation = watcher_engine.subscribe_pip_services();
+            loop {
+                let registered: Vec<RemotePipEndpoint> = watcher_engine
+                    .pip_remote_services()
+                    .into_iter()
+                    .map(|service| RemotePipEndpoint {
+                        endpoint: service.grpc_endpoint,
+                        ca_pem: (!service.tls_ca_cert_pem.is_empty())
+                            .then_some(service.tls_ca_cert_pem),
+                    })
+                    .collect();
+                let mut merged = env_endpoints.clone();
+                for endpoint in registered {
+                    if !merged
+                        .iter()
+                        .any(|existing| existing.endpoint == endpoint.endpoint)
+                    {
+                        merged.push(endpoint);
+                    }
+                }
+                watcher_manager.set_endpoints(merged);
+                if generation.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+    } else {
+        manager.set_endpoints(env_endpoints);
+    }
+}
+
+/// Maintains one connection task per remote publisher endpoint.
+struct RemotePipManager {
+    cache: Arc<PipCache>,
+    sandbox_id: String,
+    tasks: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+}
+
+impl RemotePipManager {
+    fn new(cache: Arc<PipCache>, sandbox_id: String) -> Self {
+        Self {
+            cache,
+            sandbox_id,
+            tasks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Replace the connected endpoint set. Unchanged endpoints keep their
+    /// streams, removed endpoints are stopped, and new endpoints are
+    /// spawned.
+    fn set_endpoints(self: &Arc<Self>, endpoints: Vec<RemotePipEndpoint>) {
+        let mut tasks = self.tasks.lock().unwrap();
+        let live: std::collections::HashSet<String> =
+            endpoints.iter().map(|e| e.endpoint.clone()).collect();
+        let removed: Vec<String> = tasks
+            .keys()
+            .filter(|endpoint| !live.contains(*endpoint))
+            .cloned()
+            .collect();
+        for endpoint in &removed {
+            tracing::debug!(endpoint = %endpoint, "PIP remote stream: endpoint removed");
+            // Aborting the task skips its own fail-closed clear, so revert
+            // the deregistered publisher's context here.
+            self.cache.clear(endpoint);
+            if let Some(task) = tasks.remove(endpoint) {
+                task.abort();
+            }
+        }
+        for endpoint in endpoints {
+            if let std::collections::hash_map::Entry::Vacant(slot) =
+                tasks.entry(endpoint.endpoint.clone())
+            {
+                tracing::info!(
+                    endpoint = %endpoint.endpoint,
+                    "PIP watcher: connecting to remote policy information point"
+                );
+                let task = tokio::spawn(run_remote_pip_connection(
+                    Arc::clone(&self.cache),
+                    self.sandbox_id.clone(),
+                    endpoint.endpoint.clone(),
+                    endpoint.ca_pem.clone(),
+                ));
+                slot.insert(task);
+            }
+        }
     }
 }
 
@@ -560,10 +692,10 @@ async fn run_remote_pip_connection(
     cache: Arc<PipCache>,
     sandbox_id: String,
     endpoint: String,
-    ca_cert: Option<PathBuf>,
+    ca_pem: Option<Vec<u8>>,
 ) {
     loop {
-        match run_remote_pip_stream_once(&cache, &sandbox_id, &endpoint, &ca_cert).await {
+        match run_remote_pip_stream_once(&cache, &sandbox_id, &endpoint, &ca_pem).await {
             Ok(()) => {
                 cache.clear(&endpoint);
                 tracing::info!(
@@ -589,21 +721,18 @@ async fn run_remote_pip_stream_once(
     cache: &Arc<PipCache>,
     sandbox_id: &str,
     endpoint: &str,
-    ca_cert: &Option<PathBuf>,
+    ca_pem: &Option<Vec<u8>>,
 ) -> Result<(), PipStreamError> {
     let mut tonic_endpoint = Endpoint::from_shared(endpoint.to_string())
         .map_err(|e| PipStreamError::Other(format!("invalid endpoint: {e}")))?
         .connect_timeout(Duration::from_secs(5));
     if endpoint.starts_with("https://") {
-        let tls = match ca_cert {
-            Some(path) => {
-                let pem = std::fs::read(path)
-                    .map_err(|e| PipStreamError::Other(format!("read CA cert: {e}")))?;
+        let tls = ca_pem
+            .clone()
+            .map_or_else(tonic::transport::ClientTlsConfig::new, |pem| {
                 tonic::transport::ClientTlsConfig::new()
                     .ca_certificate(tonic::transport::Certificate::from_pem(pem))
-            }
-            None => tonic::transport::ClientTlsConfig::new(),
-        };
+            });
         tonic_endpoint = tonic_endpoint
             .tls_config(tls)
             .map_err(|e| PipStreamError::Other(format!("TLS config: {e}")))?;
@@ -1017,6 +1146,66 @@ mod tests {
         shutdown.send(true).expect("signal publisher shutdown");
         server.abort();
         wait_until(|| cache.merged().is_none().then_some(())).await;
+    }
+
+    #[tokio::test]
+    async fn engine_registered_remote_publisher_streams_and_reconciles() {
+        // Gateway-registered publishers arrive through the OPA engine
+        // (`[[openshell.supervisor.pip]]` in gateway.toml → configuration
+        // snapshot → replace_pip_services). Registering an endpoint connects
+        // it; replacing the registration set disconnects the old endpoint.
+        const POLICY_REGO: &str = include_str!("../data/sandbox-policy.rego");
+
+        let seen = Arc::new(Mutex::new(None));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let service = MockPip {
+            expected_sandbox_id: "sbx-99".to_string(),
+            seen_sandbox_id: Arc::clone(&seen),
+            shutdown: shutdown_rx,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(PolicyInformationPointServer::new(service))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        let engine = Arc::new(
+            crate::opa::OpaEngine::from_strings(POLICY_REGO, "network_policies: {}\n")
+                .expect("engine"),
+        );
+        let cache = Arc::new(PipCache::new());
+        let pid = Arc::new(AtomicU32::new(0));
+        run_pip_watcher_with_engine(
+            Arc::clone(&cache),
+            pid,
+            "sbx-99".to_string(),
+            Arc::clone(&engine),
+        )
+        .await;
+
+        // No registrations yet: nothing connects.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(cache.merged().is_none());
+
+        engine.replace_pip_services(vec![openshell_core::proto::SupervisorPipService {
+            name: "navra".to_string(),
+            grpc_endpoint: format!("http://{addr}"),
+            tls_ca_cert_pem: Vec::new(),
+        }]);
+        let merged = wait_until(|| cache.merged()).await;
+        assert_eq!(merged["trust_state"], "suspended");
+        assert_eq!(*seen.lock().unwrap(), Some("sbx-99".to_string()));
+
+        // Removing the registration stops the stream and reverts the cache.
+        engine.replace_pip_services(Vec::new());
+        wait_until(|| cache.merged().is_none().then_some(())).await;
+
+        shutdown_tx.send(true).expect("signal publisher shutdown");
+        server.abort();
     }
 
     #[tokio::test]

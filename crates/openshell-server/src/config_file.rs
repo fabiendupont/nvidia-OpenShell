@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 use openshell_core::proto::{
     SupervisorMiddlewareBinding, SupervisorMiddlewareBindingPolicy, SupervisorMiddlewareService,
+    SupervisorPipService,
 };
 use openshell_core::sandbox_env::OtlpProtocol;
 use openshell_core::{
@@ -1085,6 +1086,11 @@ pub struct SupervisorFileSection {
     /// operator-owned and changes require a gateway restart.
     #[serde(default)]
     pub middleware: Vec<MiddlewareServiceFileConfig>,
+    /// Statically registered remote Policy Information Point publishers
+    /// (RFC 0019). Registration is the configuration-time authorization for
+    /// these publishers; changes require a gateway restart.
+    #[serde(default)]
+    pub pip: Vec<PipServiceFileConfig>,
     /// Shared network-supervisor configuration. This is intentionally outside
     /// the compute-driver tables so every supported driver consumes the same
     /// startup contract.
@@ -1257,6 +1263,44 @@ impl TryFrom<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
                     ToString::to_string,
                 ),
             allow_insecure_transport: config.allow_insecure_transport,
+        })
+    }
+}
+
+/// One `[[openshell.supervisor.pip]]` remote Policy Information Point
+/// publisher registration (RFC 0019).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PipServiceFileConfig {
+    /// Operator-facing name used for diagnostics and OCSF origin attribution.
+    pub name: String,
+    /// HTTP or HTTPS gRPC endpoint reachable by supervisors.
+    pub grpc_endpoint: String,
+    /// Optional PEM trust-root bundle for an HTTPS endpoint.
+    #[serde(default)]
+    pub tls_ca_cert_path: Option<PathBuf>,
+}
+
+impl TryFrom<&PipServiceFileConfig> for SupervisorPipService {
+    type Error = ConfigFileError;
+
+    fn try_from(config: &PipServiceFileConfig) -> Result<Self, Self::Error> {
+        let tls_ca_cert_pem = match &config.tls_ca_cert_path {
+            Some(path) => {
+                let pem =
+                    std::fs::read(path).map_err(|source| ConfigFileError::MiddlewareTlsCaRead {
+                        name: config.name.clone(),
+                        path: path.clone(),
+                        source,
+                    })?;
+                sanitize_ca_cert_pem(&config.name, path, &pem)?
+            }
+            None => Vec::new(),
+        };
+        Ok(Self {
+            name: config.name.clone(),
+            grpc_endpoint: config.grpc_endpoint.clone(),
+            tls_ca_cert_pem,
         })
     }
 }
@@ -2971,6 +3015,61 @@ additional_ca_bundle = "/etc/new-ca.pem"
                 .additional_ca_bundle
                 .is_none()
         );
+    }
+
+    #[test]
+    fn parses_supervisor_pip_registration() {
+        let certificate =
+            openshell_crypto::pki::generate_simple_self_signed(vec!["localhost".to_string()])
+                .expect("test certificate");
+        let mut ca = tempfile::Builder::new()
+            .suffix(".pem")
+            .tempfile()
+            .expect("CA tempfile");
+        ca.write_all(certificate.cert.pem().as_bytes())
+            .expect("write CA");
+        let toml = r#"
+[[openshell.supervisor.pip]]
+name = "navra"
+grpc_endpoint = "https://navra.internal:50051"
+tls_ca_cert_path = 'CA_PATH'
+"#
+        .replace("CA_PATH", &ca.path().display().to_string());
+        let tmp = write_tmp(&toml);
+        let file = load(tmp.path()).expect("valid PIP registration parses");
+        assert_eq!(
+            file.openshell.supervisor.pip,
+            vec![PipServiceFileConfig {
+                name: "navra".into(),
+                grpc_endpoint: "https://navra.internal:50051".into(),
+                tls_ca_cert_path: Some(ca.path().to_path_buf()),
+            }]
+        );
+        let registration = SupervisorPipService::try_from(&file.openshell.supervisor.pip[0])
+            .expect("valid CA resolves");
+        assert_eq!(registration.name, "navra");
+        assert_eq!(registration.grpc_endpoint, "https://navra.internal:50051");
+        let registered_pem = String::from_utf8(registration.tls_ca_cert_pem.clone())
+            .expect("registered CA remains PEM text")
+            .replace("\r\n", "\n");
+        let generated_pem = certificate.cert.pem().replace("\r\n", "\n");
+        assert_eq!(registered_pem, generated_pem);
+    }
+
+    #[test]
+    fn supervisor_pip_registration_rejects_unknown_fields() {
+        let tmp = write_tmp(
+            r"
+[[openshell.supervisor.pip]]
+name = 'navra'
+grpc_endpoint = 'http://127.0.0.1:50051'
+audience = 'bogus'
+",
+        );
+        assert!(matches!(
+            load(tmp.path()),
+            Err(ConfigFileError::Parse { .. })
+        ));
     }
 
     #[test]

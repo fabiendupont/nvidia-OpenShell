@@ -1010,6 +1010,7 @@ async fn draft_receipts_replay_after_chunk_state_and_review_tokens_change() {
     };
     state.store.put_message(&sandbox).await.unwrap();
     let rule = |name: &str| NetworkPolicyRule {
+        pip_deny_rules: Vec::new(),
         name: name.into(),
         endpoints: vec![NetworkEndpoint {
             host: format!("{name}.example.com"),

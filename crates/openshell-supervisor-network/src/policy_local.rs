@@ -1231,6 +1231,7 @@ fn network_rule_from_json(
         name: rule.name.unwrap_or_default(),
         endpoints,
         binaries,
+        pip_deny_rules: Vec::new(),
     })
 }
 
@@ -2142,6 +2143,7 @@ mod tests {
             rule_name: "github_write".to_string(),
             binary: "/usr/bin/curl".to_string(),
             proposed_rule: Some(NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "github_write".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "api.github.com".to_string(),
@@ -2207,6 +2209,7 @@ mod tests {
     // merged. Both reused across reload-readiness tests.
     fn proposed_curl_rule_for_github() -> NetworkPolicyRule {
         NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "agent_proposed".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -2281,6 +2284,7 @@ mod tests {
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 *policy.write().await = Some(Arc::new(policy_with_rule(NetworkPolicyRule {
+                    pip_deny_rules: Vec::new(),
                     name: "unrelated".to_string(),
                     endpoints: vec![NetworkEndpoint {
                         host: "api.example.com".to_string(),

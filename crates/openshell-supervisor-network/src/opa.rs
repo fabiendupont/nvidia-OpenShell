@@ -168,6 +168,24 @@ fn emit_binary_identity_mode(require_binary_identity: bool, source: &str) {
     );
 }
 
+/// Reject operator-supplied Rego that references `input.pip`.
+///
+/// The baked policy is the only trusted consumer of PIP context, and it
+/// enforces deny-only semantics structurally (`pip_denies_network` can only
+/// subtract from `allow_network`). A custom policy could instead map a
+/// published property to an allow decision, letting a compromised in-sandbox
+/// publisher expand egress beyond the baseline allowlist. Authors express PIP
+/// denials with the authored `pip_deny_rules` network policy field instead.
+fn validate_no_pip_input_reference(policy: &str, source: &str) -> Result<()> {
+    if policy != BAKED_POLICY_RULES && policy.contains("input.pip") {
+        return Err(miette::miette!(
+            "custom {source} policy may not reference input.pip: PIP context is deny-only. \
+             Express PIP denials with the authored pip_deny_rules network policy field"
+        ));
+    }
+    Ok(())
+}
+
 /// Sandbox configuration extracted from OPA data at startup.
 pub struct SandboxConfig {
     pub filesystem: FilesystemPolicy,
@@ -193,6 +211,12 @@ pub struct OpaEngine {
     /// in-sandbox governance software (RFC 0019). Shared with the watcher
     /// task; merged into `input.pip` on every evaluation.
     pip_cache: Arc<crate::pip::PipCache>,
+    /// Operator-registered remote PIP publishers (RFC 0019), installed from
+    /// the gateway configuration snapshot and reconciled by the policy poll
+    /// loop. The PIP watcher subscribes to changes.
+    pip_services: RwLock<Vec<openshell_core::proto::SupervisorPipService>>,
+    /// Bumped whenever `pip_services` is replaced.
+    pip_services_tx: watch::Sender<u64>,
 }
 
 #[cfg(test)]
@@ -328,6 +352,8 @@ impl OpaEngine {
             generation_tx,
             fail_closed_reason: RwLock::new(None),
             pip_cache: Arc::new(crate::pip::PipCache::new()),
+            pip_services: RwLock::new(Vec::new()),
+            pip_services_tx: watch::channel(0).0,
         }
     }
 
@@ -337,6 +363,32 @@ impl OpaEngine {
     /// into this cache; every policy evaluation reads from it.
     pub fn pip_cache(&self) -> Arc<crate::pip::PipCache> {
         Arc::clone(&self.pip_cache)
+    }
+
+    /// Install the operator-registered remote PIP publishers.
+    ///
+    /// Called from the gateway snapshot at startup and by the policy poll
+    /// loop on reconciliation changes. Registration is the
+    /// configuration-time authorization for these endpoints.
+    pub fn replace_pip_services(&self, services: Vec<openshell_core::proto::SupervisorPipService>) {
+        if let Ok(mut guard) = self.pip_services.write() {
+            *guard = services;
+        }
+        self.pip_services_tx
+            .send_modify(|generation| *generation += 1);
+    }
+
+    /// The currently registered remote PIP publishers.
+    pub fn pip_remote_services(&self) -> Vec<openshell_core::proto::SupervisorPipService> {
+        self.pip_services
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    /// Subscribe to remote PIP publisher registration changes.
+    pub fn subscribe_pip_services(&self) -> watch::Receiver<u64> {
+        self.pip_services_tx.subscribe()
     }
 
     /// Build the OPA input document for `input`, merging the cached PIP
@@ -408,6 +460,9 @@ impl OpaEngine {
         // original error, including its source chain, at the load boundary.
         let yaml_str = std::fs::read_to_string(data_path)
             .map_err(|_| miette::miette!("failed to read YAML policy data file"))?;
+        let policy_str = std::fs::read_to_string(policy_path)
+            .map_err(|_| miette::miette!("failed to read Rego policy file"))?;
+        validate_no_pip_input_reference(&policy_str, "file")?;
         let mut engine = new_regorus_engine()?;
         engine
             .add_policy_from_file(policy_path)
@@ -455,6 +510,7 @@ impl OpaEngine {
         require_binary_identity: bool,
         validate_middleware_config: Option<&MiddlewareConfigValidator>,
     ) -> Result<Self> {
+        validate_no_pip_input_reference(policy, "string")?;
         let mut engine = new_regorus_engine()?;
         engine
             .add_policy("policy.rego".into(), policy.into())
@@ -1535,6 +1591,18 @@ fn validate_opa_data_structure(data: &serde_json::Value) -> Result<()> {
             validate_opa_object_array(endpoint.get("deny_rules"), "network endpoint deny_rules")?;
         }
         validate_opa_object_array(policy.get("binaries"), "network policy binaries")?;
+        for pip in validate_opa_object_array(
+            policy.get("pip_deny_rules"),
+            "network policy pip_deny_rules",
+        )? {
+            if !pip.get("key").is_some_and(serde_json::Value::is_string)
+                || !pip.get("equals").is_some_and(serde_json::Value::is_string)
+            {
+                return Err(miette::miette!(
+                    "network policy pip_deny_rules entries must set string key and equals"
+                ));
+            }
+        }
     }
 
     Ok(())
@@ -1632,6 +1700,7 @@ fn redacted_policy_violation_category(violation: &PolicyViolation) -> &'static s
             "conflicting credential rewrite configuration"
         }
         PolicyViolation::InvalidL7Endpoint { .. } => "invalid L7 endpoint configuration",
+        PolicyViolation::InvalidPipDenyRule { .. } => "invalid PIP deny rule",
         PolicyViolation::InvalidMiddlewareConfig { .. } => "invalid middleware configuration",
         PolicyViolation::TooManyMiddlewareConfigs { .. } => {
             "middleware configuration limit exceeded"
@@ -2344,6 +2413,12 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
         .network_policies
         .iter()
         .map(|(key, rule)| {
+            let pip_deny_rules: Vec<serde_json::Value> = rule
+                .pip_deny_rules
+                .iter()
+                .filter(|pip| !pip.key.is_empty() && !pip.equals.is_empty())
+                .map(|pip| serde_json::json!({"key": pip.key, "equals": pip.equals}))
+                .collect();
             let endpoints: Vec<serde_json::Value> = rule
                 .endpoints
                 .iter()
@@ -2617,11 +2692,14 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     entries
                 })
                 .collect();
-            let policy = serde_json::json!({
+            let mut policy = serde_json::json!({
                 "name": rule.name,
                 "endpoints": endpoints,
                 "binaries": binaries,
             });
+            if !pip_deny_rules.is_empty() {
+                policy["pip_deny_rules"] = pip_deny_rules.into();
+            }
             (key.clone(), policy)
         })
         .collect();
@@ -2946,6 +3024,7 @@ mod tests {
             candidate.network_policies.insert(
                 format!("private-policy-{index}"),
                 NetworkPolicyRule {
+                    pip_deny_rules: Vec::new(),
                     name: format!("private-rule-{index}"),
                     endpoints: vec![NetworkEndpoint {
                         host: "*.example.com".into(),
@@ -3373,6 +3452,7 @@ mod tests {
         network_policies.insert(
             "claude_code".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "claude_code".to_string(),
                 endpoints: vec![
                     NetworkEndpoint {
@@ -3394,6 +3474,7 @@ mod tests {
         network_policies.insert(
             "gitlab".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "gitlab".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "gitlab.com".to_string(),
@@ -3429,6 +3510,7 @@ mod tests {
         policy.network_policies.insert(
             "mcp".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "mcp".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "mcp.example.com".to_string(),
@@ -3460,6 +3542,7 @@ mod tests {
             network_policies: std::collections::HashMap::from([(
                 "selector_projection".to_string(),
                 NetworkPolicyRule {
+                    pip_deny_rules: Vec::new(),
                     name: "selector_projection".to_string(),
                     endpoints: vec![NetworkEndpoint {
                         host: "api.example.com".to_string(),
@@ -4239,8 +4322,24 @@ process:
     }
 
     #[test]
-    fn pip_trust_state_suspension_denies_otherwise_allowed_egress() {
-        let engine = test_engine();
+    fn authored_pip_deny_rule_denies_otherwise_allowed_egress() {
+        // A network policy that would otherwise allow the request declares a
+        // PIP deny condition on the published trust_state.
+        let data = r#"
+network_policies:
+  claude_code:
+    name: claude_code
+    endpoints:
+      - host: api.anthropic.com
+        ports: [443]
+    binaries:
+      - path: /usr/bin/node
+    pip_deny_rules:
+      - key: trust_state
+        equals: suspended
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data)
+            .expect("policy with pip_deny_rules must load");
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
             port: 443,
@@ -4271,6 +4370,28 @@ process:
             "deny reason must attribute the PIP, got: {}",
             decision.reason
         );
+
+        // A published property the rule does not match leaves the allow in
+        // place: the deny condition is an exact-match guard, not a blanket.
+        engine.pip_cache().update(
+            "defenseclaw",
+            crate::pip::PipOrigin::Sandbox,
+            std::collections::BTreeMap::from([("trust_state".to_string(), "healthy".to_string())]),
+        );
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(decision.allowed, "non-matching PIP value must not deny");
+
+        // A different key with the deny value must not fire either.
+        engine.pip_cache().update(
+            "defenseclaw",
+            crate::pip::PipOrigin::Sandbox,
+            std::collections::BTreeMap::from([(
+                "data_classification".to_string(),
+                "suspended".to_string(),
+            )]),
+        );
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(decision.allowed, "non-matching PIP key must not deny");
 
         // Disconnect reverts the context to null and the baseline allowlist
         // applies unchanged.
@@ -4307,6 +4428,23 @@ process:
         let authorization = engine.authorize_egress(&input).unwrap();
         assert!(!authorization.pip_influenced);
         assert!(authorization.pip.is_none());
+    }
+
+    #[test]
+    fn custom_rego_referencing_input_pip_is_rejected() {
+        // The baked policy may consume input.pip; an operator-supplied policy
+        // may not, because nothing would hold its usage to deny-only
+        // semantics. Authored pip_deny_rules is the supported surface.
+        let hostile = "package openshell.sandbox\nallow_network if { input.pip.trust_state == \"trusted\" }\n";
+        let Err(error) = OpaEngine::from_strings(hostile, "network_policies: {}\n") else {
+            panic!("custom rego referencing input.pip must be rejected")
+        };
+        assert!(
+            error.to_string().contains("deny-only"),
+            "error must explain the deny-only constraint, got: {error}"
+        );
+        // The baked policy itself loads unchanged.
+        assert!(OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").is_ok());
     }
 
     #[test]
@@ -5788,6 +5926,7 @@ process:
         proto.network_policies = std::collections::HashMap::from([(
             "owner".to_owned(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "owner".to_owned(),
                 endpoints: vec![NetworkEndpoint {
                     host: "api.example.test".to_owned(),
@@ -5841,6 +5980,7 @@ process:
         network_policies.insert(
             "test_l7".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "test_l7".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "host.k3d.internal".to_string(),
@@ -6464,6 +6604,7 @@ network_policies:
         network_policies.insert(
             "query_proto".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "query_proto".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "api.proto.com".to_string(),
@@ -6534,6 +6675,7 @@ network_policies:
         network_policies.insert(
             "jsonrpc_proto".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "jsonrpc_proto".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "jsonrpc.proto.com".to_string(),
@@ -6606,6 +6748,7 @@ network_policies:
         network_policies.insert(
             "mcp_proto".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "mcp_proto".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "mcp.proto.com".to_string(),
@@ -7949,6 +8092,7 @@ network_policies:
                 policy.network_policies.insert(
                     "protocol_names".into(),
                     NetworkPolicyRule {
+                        pip_deny_rules: Vec::new(),
                         name: "protocol_names".into(),
                         endpoints: vec![NetworkEndpoint {
                             host: "protocol.example.com".into(),
@@ -8365,6 +8509,7 @@ network_policies:
         network_policies.insert(
             "npm".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "npm".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "registry.npmjs.org".to_string(),
@@ -8422,6 +8567,7 @@ network_policies:
         network_policies.insert(
             "gateway".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "gateway".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "gateway.example.com".to_string(),
@@ -8479,6 +8625,7 @@ network_policies:
         network_policies.insert(
             "bedrock".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "bedrock".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "bedrock-runtime.us-east-2.amazonaws.com".to_string(),
@@ -8538,6 +8685,7 @@ network_policies:
         network_policies.insert(
             "custom_vpc".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "custom_vpc".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "custom-vpc-endpoint.example.com".to_string(),
@@ -8599,6 +8747,7 @@ network_policies:
         network_policies.insert(
             "slack".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "slack".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "slack.com".to_string(),
@@ -8732,6 +8881,7 @@ network_policies:
         policy.network_policies.insert(
             "wildcard".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "wildcard".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "*.example.com".to_string(),
@@ -8747,6 +8897,7 @@ network_policies:
         policy.network_policies.insert(
             "exact".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "exact".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "api.example.com".to_string(),
@@ -8870,6 +9021,7 @@ network_policies:
             network_policies: std::collections::HashMap::from([(
                 "private-policy-name".to_string(),
                 NetworkPolicyRule {
+                    pip_deny_rules: Vec::new(),
                     name: "private-rule-name".to_string(),
                     endpoints,
                     binaries: vec![NetworkBinary {
@@ -10112,6 +10264,7 @@ network_policies:
         network_policies.insert(
             "app-api".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "app-api".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "internal-admin.local".to_string(),
@@ -10183,6 +10336,7 @@ network_policies:
         network_policies.insert(
             "internal".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "internal".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "internal.corp.net".to_string(),
@@ -10413,6 +10567,7 @@ network_policies:
         network_policies.insert(
             "multi".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "multi".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "api.example.com".to_string(),
@@ -11385,6 +11540,7 @@ network_policies:
         network_policies.insert(
             "pypi".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "pypi".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "pypi.org".to_string(),
@@ -11446,6 +11602,7 @@ network_policies:
         new_proto.network_policies.insert(
             "python_api".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "python_api".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "pypi.org".to_string(),
@@ -11519,6 +11676,7 @@ network_policies:
         new_proto.network_policies.insert(
             "python_api".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "python_api".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "pypi.org".to_string(),
@@ -11725,6 +11883,7 @@ network_policies:
         new_proto.network_policies.insert(
             "python_api".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "python_api".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "pypi.org".to_string(),
@@ -12064,6 +12223,7 @@ network_policies:
         network_policies.insert(
             "test".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "test".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "example.com".to_string(),
@@ -12227,6 +12387,7 @@ process:
         network_policies.insert(
             "python".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "python".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "pypi.org".to_string(),

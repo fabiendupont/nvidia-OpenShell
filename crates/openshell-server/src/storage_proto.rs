@@ -177,12 +177,17 @@ mod tests {
     // selections absent; storage.v1 remains frozen. Public field 3 retains its
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
+    // Policy Information Point support (RFC 0019) adds the public
+    // PipDenyRule message and pip_deny_rules to NetworkPolicyRule, and
+    // SupervisorPipService with the supervisor_pip_services snapshot field.
+    // Both are additive with proto3 defaults; stored policies decode with an
+    // empty PIP deny list and configuration snapshots with no registrations.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "3b4c2af6cf22e7ed1d84279ff865acb0db7199717bee9bc041caef791334104d";
+        "a8a0561154673c160fea86e807e21d0ff021bc81e48daa0073266921064d57de";
     const DURABLE_SCHEMA_SHA256: &str =
-        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
+        "b96783c4e19e3e11eb249894d99374150fba60c26e3cad675a8c0c66cbf00ec0";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
+        "d9d2445e869cad6e95e266f454880dc2961a2a789e3df0e1c7fe6886702d8ab2";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -562,6 +567,7 @@ mod tests {
         let mut compiled_method_count = 0;
         let mut isolation_methods = BTreeSet::new();
         let mut sandbox_protocol_methods = BTreeSet::new();
+        let mut pip_methods = BTreeSet::new();
         let mut supervisor_host_methods = BTreeSet::new();
         for file in &public.file {
             let package = file.package.as_deref().unwrap_or_default();
@@ -585,6 +591,18 @@ mod tests {
                             .as_deref()
                             .expect("sandbox protocol method name")
                     }));
+                }
+                // Policy Information Point publishers live inside the
+                // sandbox or are operator-deployed; the supervisor is the
+                // only client, so the RPC is not public SDK surface.
+                if package == "openshell.pip.v1" {
+                    assert_eq!(service_name, "PolicyInformationPoint");
+                    pip_methods.extend(
+                        service
+                            .method
+                            .iter()
+                            .map(|method| method.name.as_deref().expect("pip method name")),
+                    );
                 }
                 // Private gateway-to-shared-supervisor protocol: served by the
                 // gateway but never part of the public SDK surface.
@@ -632,6 +650,7 @@ mod tests {
             BTreeSet::from(["Exchange", "Mediate"])
         );
         assert_eq!(supervisor_host_methods, BTreeSet::from(["Attach"]));
+        assert_eq!(pip_methods, BTreeSet::from(["StreamContext"]));
         for signature in PROVIDER_READINESS_RPC_SIGNATURES {
             assert!(
                 methods.iter().any(|method| method == signature),
@@ -657,7 +676,8 @@ mod tests {
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
                 + sandbox_protocol_methods.len()
-                + supervisor_host_methods.len(),
+                + supervisor_host_methods.len()
+                + pip_methods.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
@@ -723,9 +743,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (337, 31),
-                (100, 22),
-                (86, 22),
+                (339, 31),
+                (101, 22),
+                (87, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256

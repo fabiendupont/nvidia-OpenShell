@@ -3117,6 +3117,7 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
         global_policy_version,
         provider_env_revision,
         supervisor_middleware_services,
+        supervisor_pip_services: state.config.pip_services.clone(),
         workspace,
         policy_validation_failure_mode: state
             .config
@@ -3145,6 +3146,7 @@ fn sandbox_config_response(snapshot: SandboxConfigSnapshot) -> GetSandboxConfigR
         global_policy_version: snapshot.global_policy_version,
         provider_env_revision: snapshot.provider_env_revision,
         supervisor_middleware_services: snapshot.supervisor_middleware_services,
+        supervisor_pip_services: snapshot.supervisor_pip_services,
         workspace: snapshot.workspace,
         policy_validation_failure_mode: snapshot.policy_validation_failure_mode,
         extension_authentication_enabled: snapshot.extension_authentication_enabled,
@@ -8599,6 +8601,7 @@ mod tests {
         base.network_policies.insert(
             "allow_index_crates_io_443".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "explicit-index".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "index.crates.io".to_string(),
@@ -8611,6 +8614,7 @@ mod tests {
             },
         );
         let proposal = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "allow_index_crates_io_443".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "index.crates.io".to_string(),
@@ -10892,6 +10896,7 @@ mod tests {
         let chunk = |name: &str| PolicyChunk {
             rule_name: name.to_string(),
             proposed_rule: Some(NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: name.to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: format!("{name}.example.com"),
@@ -11155,6 +11160,7 @@ mod tests {
             ..Default::default()
         };
         let selected = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "selected".to_string(),
             endpoints: vec![
                 endpoint.clone(),
@@ -11166,6 +11172,7 @@ mod tests {
             binaries: l7_scope_target().binaries,
         };
         let sibling = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "sibling".to_string(),
             endpoints: vec![endpoint],
             binaries: vec![NetworkBinary {
@@ -12419,6 +12426,7 @@ mod tests {
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "snapshot_consistency_test".to_string(),
                     proposed_rule: Some(NetworkPolicyRule {
+                        pip_deny_rules: Vec::new(),
                         name: "snapshot_consistency_test".to_string(),
                         endpoints: vec![NetworkEndpoint {
                             host: "proposal.example.com".to_string(),
@@ -16313,6 +16321,7 @@ mod tests {
                 .map(|(name, host, binary)| PolicyChunk {
                     rule_name: name.to_string(),
                     proposed_rule: Some(NetworkPolicyRule {
+                        pip_deny_rules: Vec::new(),
                         name: name.to_string(),
                         endpoints: vec![NetworkEndpoint {
                             host: host.to_string(),
@@ -16438,6 +16447,7 @@ mod tests {
                     PolicyChunk {
                         rule_name: "inspected".to_string(),
                         proposed_rule: Some(NetworkPolicyRule {
+                            pip_deny_rules: Vec::new(),
                             name: "inspected".to_string(),
                             endpoints: vec![NetworkEndpoint {
                                 host: "shared.example.com".to_string(),
@@ -16457,6 +16467,7 @@ mod tests {
                     PolicyChunk {
                         rule_name: "conflicting".to_string(),
                         proposed_rule: Some(NetworkPolicyRule {
+                            pip_deny_rules: Vec::new(),
                             name: "conflicting".to_string(),
                             endpoints: vec![NetworkEndpoint {
                                 host: "shared.example.com".to_string(),
@@ -16583,6 +16594,7 @@ mod tests {
             PolicyMergeOp::AddRule {
                 rule_name: "alpha".to_string(),
                 rule: NetworkPolicyRule {
+                    pip_deny_rules: Vec::new(),
                     name: "alpha".to_string(),
                     endpoints: vec![NetworkEndpoint {
                         host: "alpha.example.com".to_string(),
@@ -16597,6 +16609,7 @@ mod tests {
             PolicyMergeOp::AddRule {
                 rule_name: "beta".to_string(),
                 rule: NetworkPolicyRule {
+                    pip_deny_rules: Vec::new(),
                     name: "beta".to_string(),
                     endpoints: vec![NetworkEndpoint {
                         host: "beta.example.com".to_string(),
@@ -16663,6 +16676,7 @@ mod tests {
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "private_service".to_string(),
                     proposed_rule: Some(NetworkPolicyRule {
+                        pip_deny_rules: Vec::new(),
                         name: "private_service".to_string(),
                         endpoints: vec![NetworkEndpoint {
                             host: "service.example.com".to_string(),
@@ -16778,6 +16792,7 @@ mod tests {
             .unwrap();
 
         let safe_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "edited_service".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "service.example.com".to_string(),
@@ -16896,6 +16911,7 @@ mod tests {
             .unwrap();
 
         let rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "legacy_private".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "service.example.com".to_string(),
@@ -16971,6 +16987,7 @@ mod tests {
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "private_service".to_string(),
                     proposed_rule: Some(NetworkPolicyRule {
+                        pip_deny_rules: Vec::new(),
                         name: "private_service".to_string(),
                         endpoints: vec![NetworkEndpoint {
                             host: "service.example.com".to_string(),
@@ -17036,6 +17053,7 @@ mod tests {
         // The first observation is clean and remains pending in the default
         // manual mode. Its normalized endpoint columns become the dedup key.
         let safe_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "safe_service".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "service.example.com".to_string(),
@@ -17077,6 +17095,7 @@ mod tests {
         // dedup columns remain service.example.com:443 + /usr/bin/curl. This
         // replacement has no advisory notes but does add credentialed reach.
         let finding_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: safe_rule.name.clone(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -17204,6 +17223,7 @@ mod tests {
         let sandbox_name = sandbox.object_name().to_string();
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "allow_github".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -17461,6 +17481,7 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "allow_example".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.example.com".to_string(),
@@ -17578,6 +17599,7 @@ mod tests {
         seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "github_contents_write".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -17698,6 +17720,7 @@ mod tests {
         // Step 1: mechanistic submits a broad L4 grant; the prover flags it
         // HIGH, so it lands in pending.
         let mechanistic_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "allow_api_github_com_443".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -17770,6 +17793,7 @@ mod tests {
         // validation verdict — supersede is unconditional on `(host, port,
         // binary)` overlap.
         let agent_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "github_contents_put".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -17912,6 +17936,7 @@ mod tests {
         seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "anon_l4".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "example.com".to_string(),
@@ -17977,6 +18002,7 @@ mod tests {
         base_policy.network_policies.insert(
             "cargo_registry".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "cargo-registry".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "index.crates.io".to_string(),
@@ -18025,6 +18051,7 @@ mod tests {
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "allow_index_crates_io_443".to_string(),
                     proposed_rule: Some(NetworkPolicyRule {
+                        pip_deny_rules: Vec::new(),
                         name: "allow_index_crates_io_443".to_string(),
                         endpoints: vec![NetworkEndpoint {
                             host: "index.crates.io".to_string(),
@@ -18145,6 +18172,7 @@ mod tests {
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "bad_graphql".to_string(),
                     proposed_rule: Some(NetworkPolicyRule {
+                        pip_deny_rules: Vec::new(),
                         name: "bad-graphql".to_string(),
                         endpoints: vec![NetworkEndpoint {
                             host: "api.example.com".to_string(),
@@ -18230,6 +18258,7 @@ mod tests {
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "example".to_string(),
                     proposed_rule: Some(NetworkPolicyRule {
+                        pip_deny_rules: Vec::new(),
                         name: "example".to_string(),
                         endpoints: vec![NetworkEndpoint {
                             host: "example.com".to_string(),
@@ -18284,6 +18313,7 @@ mod tests {
         changed_base.network_policies.insert(
             "unrelated".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "unrelated".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "unrelated.example".to_string(),
@@ -18374,6 +18404,7 @@ mod tests {
                     .map(|(name, host)| PolicyChunk {
                         rule_name: name.to_string(),
                         proposed_rule: Some(NetworkPolicyRule {
+                            pip_deny_rules: Vec::new(),
                             name: name.to_string(),
                             endpoints: vec![NetworkEndpoint {
                                 host: host.to_string(),
@@ -18491,6 +18522,7 @@ mod tests {
                     .map(|(index, host)| PolicyChunk {
                         rule_name: format!("rule{index}"),
                         proposed_rule: Some(NetworkPolicyRule {
+                            pip_deny_rules: Vec::new(),
                             name: format!("rule{index}"),
                             endpoints: vec![NetworkEndpoint {
                                 host: host.clone(),
@@ -18522,6 +18554,7 @@ mod tests {
         policy.network_policies.insert(
             format!("unrelated{version}"),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: format!("unrelated{version}"),
                 endpoints: vec![NetworkEndpoint {
                     host: format!("unrelated{version}.example"),
@@ -18596,6 +18629,7 @@ mod tests {
                 )),
                 chunk_id: chunk_id.clone(),
                 proposed_rule: Some(NetworkPolicyRule {
+                    pip_deny_rules: Vec::new(),
                     name: "rule0".to_string(),
                     endpoints: vec![NetworkEndpoint {
                         host: "edited.example.com".to_string(),
@@ -18812,6 +18846,7 @@ mod tests {
             .await
             .unwrap();
         let rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "example".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "example.com".to_string(),
@@ -18892,6 +18927,7 @@ mod tests {
                     ..Default::default()
                 };
                 let mut rule = NetworkPolicyRule {
+                    pip_deny_rules: Vec::new(),
                     name: "github_split".to_string(),
                     endpoints: vec![endpoint(first), endpoint(second)],
                     binaries: vec![NetworkBinary {
@@ -18903,6 +18939,7 @@ mod tests {
                     base.network_policies.insert(
                         "existing".to_string(),
                         NetworkPolicyRule {
+                            pip_deny_rules: Vec::new(),
                             name: "existing".to_string(),
                             endpoints: vec![endpoint("POST")],
                             binaries: rule.binaries.clone(),
@@ -19000,6 +19037,7 @@ mod tests {
                     proposed_chunks: vec![PolicyChunk {
                         rule_name: "example".to_string(),
                         proposed_rule: Some(NetworkPolicyRule {
+                            pip_deny_rules: Vec::new(),
                             name: "example".to_string(),
                             endpoints: vec![NetworkEndpoint {
                                 host: "example.com".to_string(),
@@ -19167,6 +19205,7 @@ mod tests {
         // L7-annotated (protocol: rest, enforce) but access: full — no
         // method/path bound. Credential in scope.
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "github_l7_full".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -19276,6 +19315,7 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "anon_l4".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "example.com".to_string(),
@@ -19375,6 +19415,7 @@ mod tests {
         seed_sandbox_approval_mode(&state, &sandbox_name, "auto_on_low_risk").await;
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "anon_l4".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "example.com".to_string(),
@@ -19465,6 +19506,7 @@ mod tests {
         seed_sandbox_approval_mode(&state, &sandbox_name, "manual").await;
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "anon_l4".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "example.com".to_string(),
@@ -19559,6 +19601,7 @@ mod tests {
         seed_global_approval_mode(&state, "auto").await;
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "anon_l4".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "example.com".to_string(),
@@ -19656,6 +19699,7 @@ mod tests {
         seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "anon_l4".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "example.com".to_string(),
@@ -19748,6 +19792,7 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "github".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -19819,6 +19864,7 @@ mod tests {
         let chunk = |name: &str, endpoint: NetworkEndpoint| PolicyChunk {
             rule_name: name.to_string(),
             proposed_rule: Some(NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: name.to_string(),
                 endpoints: vec![endpoint],
                 binaries: vec![NetworkBinary {
@@ -19898,6 +19944,7 @@ mod tests {
             .unwrap();
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "_provider_work_github".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -20019,6 +20066,7 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "github_l4".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -20122,6 +20170,7 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "anon_l4".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "example.com".to_string(),
@@ -20213,6 +20262,7 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "metadata_endpoint".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "169.254.169.254".to_string(),
@@ -20349,6 +20399,7 @@ mod tests {
                     network_policies: HashMap::from([(
                         "authored_existing".to_string(),
                         NetworkPolicyRule {
+                            pip_deny_rules: Vec::new(),
                             name: "authored_existing".to_string(),
                             endpoints: vec![NetworkEndpoint {
                                 host: "api.example.test".to_string(),
@@ -20383,6 +20434,7 @@ mod tests {
             .unwrap();
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "github_contents_write".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -20601,7 +20653,7 @@ mod tests {
         seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
 
         // ── Step 1: un-credentialed GET → expected auto-approve ──
-        let uncredentialed_rule = NetworkPolicyRule {
+        let uncredentialed_rule = NetworkPolicyRule { pip_deny_rules: Vec::new(),
             name: "github_raw_openapi_get".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "raw.githubusercontent.com".to_string(),
@@ -20644,6 +20696,7 @@ mod tests {
 
         // ── Step 2: credentialed PUT → expected MEDIUM, pending ──
         let credentialed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "github_contents_put".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -20790,6 +20843,7 @@ mod tests {
         // landed, this test would still fail because the chunk_ids would
         // still need to be distinct.
         let make_rule = |rule_name: &str| NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: rule_name.to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.example.com".to_string(),
@@ -20908,6 +20962,7 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "allow_example".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.example.com".to_string(),
@@ -21028,6 +21083,7 @@ mod tests {
         seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "allow_example_8080".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "example.com".to_string(),
@@ -21296,6 +21352,7 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "allow_example".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.example.com".to_string(),
@@ -21459,6 +21516,7 @@ mod tests {
         state.store.put_message(&sandbox_b).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "allow_github".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -21770,6 +21828,7 @@ mod tests {
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "allow_example_8080".to_string(),
                     proposed_rule: Some(NetworkPolicyRule {
+                        pip_deny_rules: Vec::new(),
                         name: "allow_example_8080".to_string(),
                         endpoints: vec![NetworkEndpoint {
                             host: "example.com".to_string(),
@@ -21925,6 +21984,7 @@ mod tests {
         let operation = PolicyMergeOp::AddRule {
             rule_name: "github_api".to_string(),
             rule: NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "github_api".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "api.github.com".to_string(),
@@ -21951,6 +22011,7 @@ mod tests {
         let operation = PolicyMergeOp::AddRule {
             rule_name: "realtime_api".to_string(),
             rule: NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "realtime_api".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "realtime.example.com".to_string(),
@@ -21978,6 +22039,7 @@ mod tests {
         let operation = PolicyMergeOp::AddRule {
             rule_name: "slack_api".to_string(),
             rule: NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "slack_api".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "slack.com".to_string(),
@@ -22008,6 +22070,7 @@ mod tests {
 
         let store = test_store().await;
         let rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "google".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "google.com".to_string(),
@@ -22077,6 +22140,7 @@ mod tests {
             network_policies: std::iter::once((
                 "test_server".to_string(),
                 NetworkPolicyRule {
+                    pip_deny_rules: Vec::new(),
                     name: "test_server".to_string(),
                     endpoints: vec![NetworkEndpoint {
                         host: "192.168.1.100".to_string(),
@@ -22104,6 +22168,7 @@ mod tests {
             .unwrap();
 
         let proposed = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "allow_192_168_1_100_8567".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "192.168.1.100".to_string(),
@@ -22178,6 +22243,7 @@ mod tests {
             network_policies: std::iter::once((
                 "existing_rule".to_string(),
                 NetworkPolicyRule {
+                    pip_deny_rules: Vec::new(),
                     name: "existing_rule".to_string(),
                     endpoints: vec![NetworkEndpoint {
                         host: "api.example.com".to_string(),
@@ -22205,6 +22271,7 @@ mod tests {
             .unwrap();
 
         let proposed = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "allow_10_0_0_5_8080".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "10.0.0.5".to_string(),
@@ -23304,6 +23371,7 @@ mod tests {
                 );
             }
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "mapped".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "api.example.com".to_string(),

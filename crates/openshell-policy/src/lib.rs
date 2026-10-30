@@ -30,8 +30,8 @@ use openshell_core::mcp::{
 };
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
-    LandlockPolicy, McpOptions, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
-    SandboxPolicy,
+    LandlockPolicy, McpOptions, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PipDenyRule,
+    ProcessPolicy, SandboxPolicy,
 };
 
 pub use compose::{
@@ -65,7 +65,8 @@ use openshell_policy_schema::{
     MCP_VERSION_REMEDIATION, McpConfig as McpConfigDef, NetworkBinary as NetworkBinaryDef,
     NetworkCredentialBinding as NetworkCredentialBindingDef, NetworkEndpoint as NetworkEndpointDef,
     NetworkPolicyRule as NetworkPolicyRuleDef, ParameterMatcher as ParamMatcherDef,
-    PolicyDocument as PolicyFile, ProcessPolicy as ProcessDef, QueryMatcher as QueryMatcherDef,
+    PipDenyRule as PipDenyRuleDef, PolicyDocument as PolicyFile, ProcessPolicy as ProcessDef,
+    QueryMatcher as QueryMatcherDef,
 };
 
 fn json_rpc_config_from_proto(max_body_bytes: u32) -> Option<JsonRpcConfigDef> {
@@ -500,6 +501,14 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                 } else {
                     rule.name
                 },
+                pip_deny_rules: rule
+                    .pip_deny_rules
+                    .into_iter()
+                    .map(|pip| PipDenyRule {
+                        key: pip.key,
+                        equals: pip.equals,
+                    })
+                    .collect(),
                 endpoints: rule
                     .endpoints
                     .into_iter()
@@ -658,6 +667,14 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
         .map(|(key, rule)| -> Result<_> {
             let yaml_rule = NetworkPolicyRuleDef {
                 name: rule.name.clone(),
+                pip_deny_rules: rule
+                    .pip_deny_rules
+                    .iter()
+                    .map(|pip| PipDenyRuleDef {
+                        key: pip.key.clone(),
+                        equals: pip.equals.clone(),
+                    })
+                    .collect(),
                 endpoints: rule
                     .endpoints
                     .iter()
@@ -1074,6 +1091,12 @@ pub enum PolicyViolation {
         endpoint_index: usize,
         reason: String,
     },
+    /// A PIP deny condition on a network policy rule is structurally invalid.
+    InvalidPipDenyRule {
+        policy_name: String,
+        rule_index: usize,
+        reason: String,
+    },
     /// A middleware configuration is structurally invalid.
     InvalidMiddlewareConfig { name: String, reason: String },
     /// Too many middleware configurations are attached to one policy.
@@ -1237,6 +1260,14 @@ impl fmt::Display for PolicyViolation {
             } => write!(
                 f,
                 "network policy '{policy_name}': endpoint {endpoint_index} has invalid L7 configuration: {reason}"
+            ),
+            Self::InvalidPipDenyRule {
+                policy_name,
+                rule_index,
+                reason,
+            } => write!(
+                f,
+                "network policy '{policy_name}': pip_deny_rules[{rule_index}] is invalid: {reason}"
             ),
             Self::InvalidMiddlewareConfig { name, reason } => {
                 write!(f, "middleware config '{name}' is invalid: {reason}")
@@ -1463,6 +1494,17 @@ fn validate_sandbox_policy_with_mcp_presence(
         } else {
             rule.name.clone()
         };
+        // PIP deny conditions must name a property and a value; an empty key
+        // or value can never fire and hides the author's intent.
+        for (rule_index, pip) in rule.pip_deny_rules.iter().enumerate() {
+            if pip.key.trim().is_empty() || pip.equals.is_empty() {
+                violations.push(PolicyViolation::InvalidPipDenyRule {
+                    policy_name: name.clone(),
+                    rule_index,
+                    reason: "must set both key and equals".to_string(),
+                });
+            }
+        }
         for (endpoint_index, ep) in rule.endpoints.iter().enumerate() {
             let access = network_access_preset_to_str(ep.access).unwrap_or_default();
             let enforcement = network_enforcement_mode_to_str(ep.enforcement).unwrap_or_default();
@@ -3313,6 +3355,7 @@ network_policies:
         policy.network_policies.insert(
             "api".into(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "api".into(),
                 endpoints: vec![NetworkEndpoint {
                     host: "api.example.com".into(),
@@ -3344,6 +3387,7 @@ network_policies:
         policy.network_policies.insert(
             "api".into(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "api".into(),
                 endpoints: vec![NetworkEndpoint {
                     host: "api.example.com".into(),
@@ -3368,6 +3412,7 @@ network_policies:
         policy.network_policies.insert(
             "api".into(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "api".into(),
                 endpoints: vec![NetworkEndpoint {
                     host: "api.example.com".into(),
@@ -3396,6 +3441,7 @@ network_policies:
         policy.network_policies.insert(
             "api".into(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "api".into(),
                 endpoints: vec![NetworkEndpoint {
                     host: "*.example.com".into(),
@@ -3578,6 +3624,7 @@ network_policies:
             policy.network_policies.insert(
                 "native-tcp".into(),
                 NetworkPolicyRule {
+                    pip_deny_rules: Vec::new(),
                     name: "native-tcp".into(),
                     endpoints: vec![NetworkEndpoint {
                         host: host.into(),
@@ -3620,6 +3667,7 @@ network_policies:
             policy.network_policies.insert(
                 "native-tcp".into(),
                 NetworkPolicyRule {
+                    pip_deny_rules: Vec::new(),
                     name: "native-tcp".into(),
                     endpoints: vec![NetworkEndpoint {
                         host: host.into(),
@@ -3652,6 +3700,7 @@ network_policies:
         policy.network_policies.insert(
             "invalid".into(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "invalid".into(),
                 endpoints: vec![NetworkEndpoint {
                     host: "database.example.com".into(),
@@ -3680,6 +3729,7 @@ network_policies:
         policy.network_policies.insert(
             "invalid".into(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "invalid".into(),
                 endpoints: vec![NetworkEndpoint {
                     host: "database.example.com".into(),
@@ -4916,6 +4966,83 @@ network_policies:
             bogus: true
 ";
         assert!(parse_sandbox_policy(yaml).is_err());
+    }
+
+    #[test]
+    fn parse_pip_deny_rules_round_trip() {
+        let yaml = r"
+version: 1
+network_policies:
+  governed:
+    endpoints:
+      - host: api.example.com
+        port: 443
+    binaries:
+      - path: /usr/bin/curl
+    pip_deny_rules:
+      - key: trust_state
+        equals: suspended
+      - key: data_classification
+        equals: phi
+";
+        let policy = parse_sandbox_policy(yaml).expect("pip_deny_rules must parse");
+        let rule = &policy.network_policies["governed"];
+        assert_eq!(rule.pip_deny_rules.len(), 2);
+        assert_eq!(rule.pip_deny_rules[0].key, "trust_state");
+        assert_eq!(rule.pip_deny_rules[0].equals, "suspended");
+        assert_eq!(rule.pip_deny_rules[1].key, "data_classification");
+        assert_eq!(rule.pip_deny_rules[1].equals, "phi");
+
+        // from_proto restores the same authored shape.
+        let yaml_out = serialize_sandbox_policy(&policy).expect("serialize back to YAML");
+        assert!(
+            yaml_out.contains("pip_deny_rules:"),
+            "pip_deny_rules must round-trip, got:\n{yaml_out}"
+        );
+        let reparsed = parse_sandbox_policy(&yaml_out).expect("round-tripped YAML must parse");
+        assert_eq!(
+            reparsed.network_policies["governed"].pip_deny_rules, rule.pip_deny_rules,
+            "round trip must preserve PIP deny rules"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unknown_fields_in_pip_deny_rule() {
+        let yaml = r"
+version: 1
+network_policies:
+  test:
+    endpoints:
+      - host: example.com
+        port: 443
+    pip_deny_rules:
+      - key: trust_state
+        equals: suspended
+        bogus: true
+";
+        assert!(parse_sandbox_policy(yaml).is_err());
+    }
+
+    #[test]
+    fn validation_rejects_incomplete_pip_deny_rule() {
+        let yaml = r"
+version: 1
+network_policies:
+  test:
+    endpoints:
+      - host: example.com
+        port: 443
+    pip_deny_rules:
+      - key: trust_state
+";
+        let policy = parse_sandbox_policy(yaml).expect("serde accepts the shape");
+        let violations = validate_sandbox_policy(&policy).expect_err("empty equals must fail");
+        assert!(
+            violations
+                .iter()
+                .any(|violation| matches!(violation, PolicyViolation::InvalidPipDenyRule { .. })),
+            "expected an InvalidPipDenyRule violation, got: {violations:?}"
+        );
     }
 
     #[test]

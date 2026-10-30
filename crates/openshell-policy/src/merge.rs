@@ -2504,6 +2504,7 @@ mod tests {
         existing_endpoint.enforcement = NetworkEnforcementMode::Enforce as i32;
         existing_endpoint.access = NetworkAccessPreset::ReadOnly as i32;
         let existing = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "cargo-registry".to_string(),
             endpoints: vec![existing_endpoint.clone()],
             binaries: vec![NetworkBinary {
@@ -2517,6 +2518,7 @@ mod tests {
         let mut observed = endpoint("index.crates.io", 443);
         observed.advisor_proposed = true;
         let incoming = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "allow_index_crates_io_443".to_string(),
             endpoints: vec![observed],
             binaries: vec![binary("/usr/bin/curl")],
@@ -2543,12 +2545,14 @@ mod tests {
         base.network_policies.insert(
             "allow_index_crates_io_443".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "explicit-index".to_string(),
                 endpoints: vec![endpoint("index.crates.io", 443)],
                 binaries: vec![binary("/usr/bin/cargo")],
             },
         );
         let incoming = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "allow_index_crates_io_443".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "index.crates.io".to_string(),
@@ -2584,6 +2588,7 @@ mod tests {
     fn canonicalize_advisor_reuses_explicit_rule_for_existing_binary() {
         let existing_endpoint = endpoint("index.crates.io", 443);
         let existing = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "cargo-registry".to_string(),
             endpoints: vec![existing_endpoint],
             binaries: vec![binary("/usr/bin/curl")],
@@ -2592,6 +2597,7 @@ mod tests {
         base.network_policies
             .insert("cargo_registry".to_string(), existing);
         let incoming = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "allow_index_crates_io_443".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "index.crates.io".to_string(),
@@ -2619,12 +2625,14 @@ mod tests {
         base.network_policies.insert(
             "advisor_index".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "advisor-index".to_string(),
                 endpoints: vec![advisor_endpoint],
                 binaries: vec![binary("/usr/bin/curl")],
             },
         );
         let incoming = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "allow_index_crates_io_443".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "index.crates.io".to_string(),
@@ -2657,12 +2665,14 @@ mod tests {
         effective.network_policies.insert(
             "_provider_example".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "provider-example".to_string(),
                 endpoints: vec![provider_endpoint.clone()],
                 binaries: Vec::new(),
             },
         );
         let incoming = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "advisor_example".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.example.com".to_string(),
@@ -2709,6 +2719,7 @@ mod tests {
         base.network_policies.insert(
             "existing_advisor".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "existing-advisor".to_string(),
                 endpoints: vec![advisor_endpoint],
                 binaries: vec![binary("/usr/bin/curl")],
@@ -2719,6 +2730,7 @@ mod tests {
         effective.network_policies.insert(
             "_provider_example".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "provider-example".to_string(),
                 endpoints: vec![provider_endpoint],
                 binaries: vec![binary("/usr/bin/gh")],
@@ -2726,6 +2738,7 @@ mod tests {
         );
 
         let incoming = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "advisor_example".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.example.com".to_string(),
@@ -2759,6 +2772,7 @@ mod tests {
         existing_endpoint.enforcement = NetworkEnforcementMode::Enforce as i32;
         existing_endpoint.access = NetworkAccessPreset::ReadOnly as i32;
         let existing = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "cargo-registry".to_string(),
             endpoints: vec![existing_endpoint],
             binaries: vec![binary("/usr/bin/cargo")],
@@ -2768,6 +2782,7 @@ mod tests {
             .insert("cargo_registry".to_string(), existing);
         let effective = base.clone();
         let incoming = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "allow_index_crates_io_443".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "index.crates.io".to_string(),
@@ -2869,6 +2884,7 @@ mod tests {
         binaries: &[&str],
     ) -> NetworkPolicyRule {
         NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: name.to_string(),
             endpoints,
             binaries: binaries.iter().map(|path| binary(path)).collect(),
@@ -3997,6 +4013,7 @@ mod tests {
         policy.network_policies.insert(
             "existing".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "existing".to_string(),
                 endpoints: vec![endpoint("api.github.com", 443)],
                 binaries: vec![NetworkBinary {
@@ -4006,6 +4023,7 @@ mod tests {
         );
 
         let incoming = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "incoming".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -4042,6 +4060,7 @@ mod tests {
         policy.network_policies.insert(
             "existing".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "existing".to_string(),
                 endpoints: vec![endpoint("api.github.com", 443)],
                 binaries: vec![binary("/usr/bin/curl")],
@@ -4049,6 +4068,7 @@ mod tests {
         );
 
         let incoming = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "incoming".to_string(),
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
@@ -4073,6 +4093,7 @@ mod tests {
     #[test]
     fn add_rule_deduplicates_binary_paths_within_incoming_rule() {
         let incoming = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "incoming".to_string(),
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![
@@ -4103,6 +4124,7 @@ mod tests {
         policy.network_policies.insert(
             "app-api".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "app-api".to_string(),
                 endpoints: vec![endpoint("api.example.com", 443)],
                 binaries: vec![NetworkBinary {
@@ -4112,6 +4134,7 @@ mod tests {
         );
 
         let incoming = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "app-api".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "internal-admin.local".to_string(),
@@ -4476,6 +4499,7 @@ mod tests {
         policy.network_policies.insert(
             "github".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "github".to_string(),
                 endpoints: vec![endpoint("api.github.com", 443)],
                 binaries: vec![NetworkBinary {
@@ -4499,6 +4523,7 @@ mod tests {
     #[test]
     fn policy_covers_rule_returns_true_when_merged_rule_present() {
         let proposed = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "agent_proposed".to_string(),
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
@@ -4521,6 +4546,7 @@ mod tests {
     #[test]
     fn policy_covers_rule_returns_false_when_unrelated_rule_present() {
         let proposed = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "agent_proposed".to_string(),
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
@@ -4550,6 +4576,7 @@ mod tests {
         // endpoints overlap, even under a different network_policies key.
         // Coverage must survive that fold — name-keyed checks would miss it.
         let proposed = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "agent_proposed".to_string(),
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
@@ -4561,6 +4588,7 @@ mod tests {
         policy.network_policies.insert(
             "preexisting_github".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "preexisting_github".to_string(),
                 endpoints: vec![endpoint("api.github.com", 443)],
                 binaries: vec![NetworkBinary {
@@ -4591,6 +4619,7 @@ mod tests {
     #[test]
     fn policy_covers_rule_returns_false_when_binary_missing() {
         let proposed = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "agent_proposed".to_string(),
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
@@ -4605,6 +4634,7 @@ mod tests {
         policy.network_policies.insert(
             "existing".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "existing".to_string(),
                 endpoints: vec![endpoint("api.github.com", 443)],
                 binaries: vec![NetworkBinary {
@@ -4633,6 +4663,7 @@ mod tests {
         // rules yet. Coverage must NOT return true here, or the agent
         // retries the PUT and hits another policy_denied.
         let proposed = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "agent_put".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -4651,6 +4682,7 @@ mod tests {
         policy.network_policies.insert(
             "existing_readonly".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "existing_readonly".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "api.github.com".to_string(),
@@ -4677,6 +4709,7 @@ mod tests {
         // Same setup as above, but with the proposed L7 rule merged in.
         // Coverage must now return true.
         let proposed = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "agent_put".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -4695,6 +4728,7 @@ mod tests {
         policy.network_policies.insert(
             "existing".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "existing".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "api.github.com".to_string(),
@@ -4722,6 +4756,7 @@ mod tests {
         // only the L4 endpoint match to be considered covered. Empty
         // proposed.rules must not be treated as "no method matches".
         let proposed = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "ssh_clone".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "github.com".to_string(),
@@ -4751,6 +4786,7 @@ mod tests {
         // A proposed rule with no binaries is the "any binary" shape.
         // A specific loaded binary list cannot cover that Cartesian scope.
         let proposed = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "any_binary_rule".to_string(),
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![],
@@ -4760,6 +4796,7 @@ mod tests {
         policy.network_policies.insert(
             "existing".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "existing".to_string(),
                 endpoints: vec![endpoint("api.github.com", 443)],
                 binaries: vec![NetworkBinary {
@@ -4817,6 +4854,7 @@ mod tests {
         // `_provider_*` rule for api.github.com with `access: read-write`
         // and gh/git binaries.
         let provider_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "_provider_work_github".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -4847,6 +4885,7 @@ mod tests {
         // Agent submits a narrow PUT rule targeting the same host/port via
         // curl. Without the filter, this would merge into the provider rule.
         let agent_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "github_contents_put".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -4922,6 +4961,7 @@ mod tests {
         );
 
         let incoming = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: "ignored_when_merging".to_string(),
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
@@ -4975,6 +5015,7 @@ mod tests {
         policy.network_policies.insert(
             "cargo_registry".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "cargo-registry".to_string(),
                 endpoints: vec![endpoint("index.crates.io", 443)],
                 binaries: vec![binary("/usr/bin/cargo")],
@@ -4988,6 +5029,7 @@ mod tests {
             &[PolicyMergeOp::AddRule {
                 rule_name: "allow_index_crates_io_443".to_string(),
                 rule: NetworkPolicyRule {
+                    pip_deny_rules: Vec::new(),
                     name: "allow_index_crates_io_443".to_string(),
                     endpoints: vec![advisor_endpoint],
                     binaries: vec![binary("/usr/bin/curl")],
@@ -5013,6 +5055,7 @@ mod tests {
         policy.network_policies.insert(
             "advisor_index".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "advisor-index".to_string(),
                 endpoints: vec![advisor_endpoint],
                 binaries: vec![binary("/usr/bin/curl")],
@@ -5024,6 +5067,7 @@ mod tests {
             &[PolicyMergeOp::AddRule {
                 rule_name: "explicit_index".to_string(),
                 rule: NetworkPolicyRule {
+                    pip_deny_rules: Vec::new(),
                     name: "explicit-index".to_string(),
                     endpoints: vec![endpoint("index.crates.io", 443)],
                     binaries: vec![binary("/usr/bin/wget")],
@@ -5056,6 +5100,7 @@ mod tests {
         let policy = policy_with_rule(
             "advisor_index",
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "advisor-index".to_string(),
                 endpoints: vec![advisor_endpoint],
                 binaries: vec![binary("/usr/bin/curl")],
@@ -5067,6 +5112,7 @@ mod tests {
             &[PolicyMergeOp::AddRule {
                 rule_name: "advisor_index".to_string(),
                 rule: NetworkPolicyRule {
+                    pip_deny_rules: Vec::new(),
                     name: "advisor-index".to_string(),
                     endpoints: vec![endpoint("index.crates.io", 443)],
                     binaries: vec![binary("/usr/bin/wget")],

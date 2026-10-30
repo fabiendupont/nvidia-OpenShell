@@ -58,7 +58,7 @@ If the binary hash does not match the TOFU cache, the supervisor logs a warning 
 **Operator-side publishers.** Governance infrastructure deployed by the operator alongside OpenShell — for example the external MCP gateway described in the motivation — publishes from outside the sandbox and cannot create sockets in the sandbox's mount namespace. The supervisor connects to a supervisor-visible endpoint instead:
 
 - Same-host deployments: a Unix domain socket in a supervisor-side PIP directory (alongside the existing supervisor socket paths). The `SO_PEERCRED` binary verification described above applies unchanged where the supervisor's process view includes the publisher — which it does whenever it includes the sandbox's processes, since per-connection binary identity already depends on that view.
-- Network deployments (for example Kubernetes, where the supervisor and the publisher run on different nodes): an operator-configured gRPC endpoint, registered and authenticated the way supervisor middleware services are today.
+- Network deployments (for example Kubernetes, where the supervisor and the publisher run on different nodes): an operator-configured gRPC endpoint, registered the way supervisor middleware services are today — `[[openshell.supervisor.pip]]` in `gateway.toml`, delivered to supervisors in the sandbox configuration snapshot and reconciled on changes. Authenticated transport (extension credentials) is follow-up work; registration itself is the configuration-time authorization.
 
 Operator-side publishers are authorized at configuration time; binary verification is retained as defense-in-depth where the transport permits. Both classes share the same `StreamContext` contract, the same cache, and the same deny-only injection into `input.pip`; when publishers of both classes are present their properties merge under the same rules.
 
@@ -105,21 +105,26 @@ The supervisor merges the latest cached properties from all connected PIPs into 
 
 When no PIP is connected, `input.pip` is null. Existing policies that do not reference `input.pip` are unaffected. When multiple PIPs are connected, their properties are merged; a key published by more than one PIP resolves deterministically to the lexicographically-later publisher name. Publishers should prefix their keys by convention (`defenseclaw.scan_status`) so collisions do not occur.
 
-Policy authors use `input.pip` in deny rules only:
+Policy authors use `input.pip` in deny rules only. Because authored network policy is data (not Rego), the authored surface is a `pip_deny_rules` list on a network policy rule; each entry names a published property `key` and a required `equals` value, and the rule denies connections it would otherwise allow when a publisher reports a matching value:
 
-```rego
-deny_network if {
-    input.network.host == data.config.analytics_host
-    input.pip.data_classification == "phi"
-}
-
-deny_network if {
-    input.pip.trust_state == "suspended"
-    input.network.host != data.config.gateway_host
-}
+```yaml
+network_policies:
+  analytics:
+    endpoints:
+      - host: logs.corp.com
+        port: 443
+    binaries:
+      - path: /usr/bin/agent
+    pip_deny_rules:
+      - key: data_classification
+        equals: phi
+      - key: trust_state
+        equals: suspended
 ```
 
-The OPA policy validator should reject policies that reference `input.pip` in allow rules. This ensures a compromised PIP cannot open network paths beyond the baseline allowlist.
+A policy that has no `pip_deny_rules` is unaffected by published context, and a rule with conditions is inert while no publisher is connected.
+
+The OPA policy validator rejects operator-supplied Rego that references `input.pip`: the baked policy is the only trusted consumer of PIP context and enforces deny-only semantics structurally, while a custom policy could map a published property to an allow decision, letting a compromised in-sandbox publisher expand egress beyond the baseline allowlist. Authored `pip_deny_rules` is the supported surface. This ensures a compromised PIP cannot open network paths beyond the baseline allowlist.
 
 ### Lifecycle
 

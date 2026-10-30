@@ -438,10 +438,12 @@ pub async fn run_networking(
         let pip_cache = engine.pip_cache();
         let pip_pid = entrypoint_pid.clone();
         let pip_sandbox_id = pip_sandbox_id.unwrap_or_default();
-        tokio::spawn(crate::pip::run_pip_watcher(
+        let pip_engine = Arc::clone(engine);
+        tokio::spawn(crate::pip::run_pip_watcher_with_engine(
             pip_cache,
             pip_pid,
             pip_sandbox_id,
+            pip_engine,
         ));
     }
 

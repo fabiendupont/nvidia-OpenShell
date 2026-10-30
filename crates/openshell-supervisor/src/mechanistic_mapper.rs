@@ -159,6 +159,7 @@ pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
         };
 
         let proposed_rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: rule_name.clone(),
             endpoints: vec![endpoint],
             binaries,

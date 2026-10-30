@@ -191,6 +191,7 @@ async fn global_policy_replaces_grant_authorities_and_preserves_profile_destinat
         network_policies: HashMap::from([(
             "global_api".into(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "global_api".into(),
                 endpoints: vec![NetworkEndpoint {
                     host: "api.example.test".into(),

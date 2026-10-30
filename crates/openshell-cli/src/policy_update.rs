@@ -110,6 +110,7 @@ pub fn build_policy_update_plan(
                 ToString::to_string,
             );
         let rule = NetworkPolicyRule {
+            pip_deny_rules: Vec::new(),
             name: target_rule_name.clone(),
             endpoints: vec![endpoint.clone()],
             binaries: deduped_binaries
@@ -604,6 +605,7 @@ mod tests {
                 policy.network_policies.insert(
                     "api".to_string(),
                     NetworkPolicyRule {
+                        pip_deny_rules: Vec::new(),
                         name: "api".to_string(),
                         binaries: vec![NetworkBinary {
                             path: binary_path.to_string(),

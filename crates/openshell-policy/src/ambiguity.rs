@@ -730,6 +730,7 @@ mod tests {
         policy.network_policies.insert(
             "left".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "left".to_string(),
                 endpoints: vec![left],
                 binaries: vec![NetworkBinary {
@@ -740,6 +741,7 @@ mod tests {
         policy.network_policies.insert(
             "right".to_string(),
             NetworkPolicyRule {
+                pip_deny_rules: Vec::new(),
                 name: "right".to_string(),
                 endpoints: vec![right],
                 binaries: vec![NetworkBinary {

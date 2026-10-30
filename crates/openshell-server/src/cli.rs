@@ -685,6 +685,21 @@ fn prepare_server_config_with_drivers(
     {
         config.policy_validation_failure_mode = mode;
     }
+
+    config.pip_services = file
+        .as_ref()
+        .map(|f| {
+            f.openshell
+                .supervisor
+                .pip
+                .iter()
+                .map(openshell_core::proto::SupervisorPipService::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })
+        .transpose()
+        .into_diagnostic()
+        .map_err(|error| miette::miette!("PIP registration failed: {error}"))?
+        .unwrap_or_default();
     config.config_delivery_mode = args
         .config_delivery_mode
         .or_else(|| {

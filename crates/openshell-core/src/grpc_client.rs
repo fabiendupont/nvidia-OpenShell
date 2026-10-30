@@ -1883,6 +1883,9 @@ pub struct SettingsPollResult {
     /// Attachment identity captured with this effective configuration.
     pub provider_attachment_epoch: String,
     pub supervisor_middleware_services: Vec<crate::proto::SupervisorMiddlewareService>,
+    /// Operator-registered remote Policy Information Point publishers
+    /// (RFC 0019). Registration is the configuration-time authorization.
+    pub supervisor_pip_services: Vec<crate::proto::SupervisorPipService>,
     /// Workspace the sandbox belongs to.
     pub workspace: String,
     /// Gateway-configured posture for rejected policy generations.
@@ -1909,6 +1912,7 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
         provider_env_revision: inner.provider_env_revision,
         provider_attachment_epoch: inner.provider_attachment_epoch,
         supervisor_middleware_services: inner.supervisor_middleware_services,
+        supervisor_pip_services: inner.supervisor_pip_services,
         workspace: inner.workspace,
         policy_validation_failure_mode: inner
             .policy_validation_failure_mode
@@ -1933,6 +1937,7 @@ impl From<crate::proto::SandboxConfigSnapshot> for SettingsPollResult {
             global_policy_version: snapshot.global_policy_version,
             provider_env_revision: snapshot.provider_env_revision,
             supervisor_middleware_services: snapshot.supervisor_middleware_services,
+            supervisor_pip_services: snapshot.supervisor_pip_services,
             workspace: snapshot.workspace,
             policy_validation_failure_mode: snapshot.policy_validation_failure_mode,
             extension_authentication_enabled: snapshot.extension_authentication_enabled,

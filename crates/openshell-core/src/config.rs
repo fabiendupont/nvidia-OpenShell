@@ -243,6 +243,11 @@ pub struct Config {
     /// Security posture for rejected sandbox policy generations.
     pub policy_validation_failure_mode: PolicyValidationFailureMode,
 
+    /// Operator-registered remote Policy Information Point publishers
+    /// (RFC 0019), delivered to supervisors in the sandbox configuration
+    /// snapshot. Registration is the configuration-time authorization.
+    pub pip_services: Vec<crate::proto::SupervisorPipService>,
+
     /// Whether supervisors poll for configuration or receive it over their session.
     pub config_delivery_mode: ConfigDeliveryMode,
 
@@ -1029,6 +1034,7 @@ impl Config {
             metrics_tls: None,
             log_level: default_log_level(),
             policy_validation_failure_mode: PolicyValidationFailureMode::default(),
+            pip_services: Vec::new(),
             config_delivery_mode: ConfigDeliveryMode::default(),
             tls,
             oidc: None,

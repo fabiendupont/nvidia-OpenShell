@@ -1031,6 +1031,7 @@ impl ProviderTypeProfile {
             name: rule_name.to_string(),
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
             binaries: self.binaries.iter().map(binary_to_proto).collect(),
+            pip_deny_rules: Vec::new(),
         }
     }
 

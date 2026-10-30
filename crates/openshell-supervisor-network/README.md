@@ -67,10 +67,17 @@ connection. Three publisher classes share one contract
 - **Operator-side publishers (same host)** serve the identical contract under
   `/run/openshell-supervisor/pip/<sandbox-id>/` (override the root with
   `OPENSHELL_PIP_HOST_DIR`). The directory is created with mode 0750.
-- **Remote publishers** are operator-configured gRPC endpoints
-  (`OPENSHELL_PIP_REMOTE_ENDPOINTS`, comma-separated; `https://` endpoints
-  take a CA bundle via `OPENSHELL_PIP_REMOTE_CA_CERT`). Configuring the list
-  is the configuration-time authorization for those publishers.
+- **Remote publishers** are operator-configured gRPC endpoints. The gateway
+  registration path is `[[openshell.supervisor.pip]]` in `gateway.toml`
+  (name, grpc_endpoint, optional CA bundle), delivered in the sandbox
+  configuration snapshot and reconciled by the policy poll loop through
+  `OpaEngine::replace_pip_services`. For the standalone proxy role,
+  `OPENSHELL_PIP_REMOTE_ENDPOINTS` (comma-separated) and
+  `OPENSHELL_PIP_REMOTE_CA_CERT` configure the same class directly.
+  Configuring either list is the configuration-time authorization for those
+  publishers; the engine watcher unions both sources and reconnects on
+  reconciliation changes, clearing the cached context of deregistered
+  endpoints.
 
 Unix-socket publishers (in-sandbox and same-host operator) are verified via
 `SO_PEERCRED` plus a TOFU SHA256 pin of the `/proc`-resolved executable; a
@@ -82,20 +89,24 @@ so baseline policy applies unchanged.
 The watcher tasks are spawned by `run_networking` whenever the OPA engine is
 active. Every OPA query builds its input through
 `OpaEngine::input_json_with_pip`, which merges the cached properties into
-`input.pip` (null when no publisher is connected). The baked policy
-(`data/sandbox-policy.rego`) treats PIP context as deny-only:
-`pip_denies_network` currently fires when
-`input.pip.trust_state == "suspended"`, and `allow_network` /
-`network_action` require `not pip_denies_network`. PIP context can never
-expand the allowlist.
+`input.pip` (null when no publisher is connected).
+
+PIP denial is policy-authored and deny-only. A network policy declares
+`pip_deny_rules` (`key`/`equals` pairs, schema in `openshell-policy-schema`,
+proto `PipDenyRule` on `NetworkPolicyRule`); the baked policy
+(`data/sandbox-policy.rego`) fires `pip_denies_network` when a rule on a
+matching policy equals a published property, and `allow_network` /
+`network_action` require `not pip_denies_network`. Published context can
+never expand the allowlist. Because a custom Rego policy could map
+`input.pip` to an allow decision, `OpaEngine::from_files`/`from_strings`
+reject operator-supplied Rego that references `input.pip` (the baked policy
+is exempt); authored `pip_deny_rules` is the supported surface.
 
 Denial attribution: `EgressAuthorization` captures a `PipSnapshot`
 (publishers with origins, merged properties) and a `pip_influenced` flag on
-denials, and the transparent-TCP denial OCSF event tags
-`pip_influenced`/`pip_publishers`/`pip_origins`/`pip_context` when the deny
-rule fired, so analysts can weight in-sandbox-sourced evidence accordingly.
-Prototype follow-ups: authored-policy deny rules that reference PIP keys
-(schema + validator work, including rejecting `input.pip` in allow rules),
-per-request L7 evaluation against `input.pip`, PIP tags on the remaining
-denial emitters, and gateway TOML registration for remote publishers
-mirroring `[[openshell.supervisor.middleware]]`.
+denials, and the denial OCSF events (transparent TCP, staged transparent,
+CONNECT) tag `pip_influenced`/`pip_publishers`/`pip_origins`/`pip_context`
+when the deny rule fired, so analysts can weight in-sandbox-sourced
+evidence accordingly. Prototype follow-ups: per-request L7 evaluation
+against `input.pip`, and authenticated transport (extension credentials)
+for remote publishers, mirroring middleware extension authentication.

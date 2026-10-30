@@ -3182,6 +3182,12 @@ async fn load_policy_with_gateway(
             // bindings, even while operator-run services are unavailable.
             install_builtin_middleware_registry(&engine).await?;
 
+            // Install operator-registered remote Policy Information Point
+            // publishers (RFC 0019). Registration in the gateway configuration
+            // is the authorization; the PIP watcher connects to these
+            // endpoints and the policy poll loop reconciles later changes.
+            engine.replace_pip_services(snapshot.supervisor_pip_services.clone());
+
             // Connect operator-registered middleware services. A connect/describe
             // failure keeps the built-in registry active so each request's
             // `on_error` policy governs matched traffic. The policy poll loop
@@ -5161,6 +5167,7 @@ network_policies:
     ) -> openshell_core::grpc_client::SettingsPollResult {
         openshell_core::grpc_client::SettingsPollResult {
             service_routes: Vec::new(),
+            supervisor_pip_services: Vec::new(),
             policy,
             version,
             policy_hash: format!("hash-v{version}"),
