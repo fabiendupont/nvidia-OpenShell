@@ -51,3 +51,31 @@ domain event and a detection finding without credential values or placeholders.
 Explicit body and WebSocket
 rewrite flags authorize those locations for ordinary static credentials. SigV4
 signing retains the endpoint-scoped resolver's existing trusted access.
+
+## Policy Information Point (RFC 0019, prototype)
+
+`pip.rs` implements the supervisor side of the Policy Information Point
+interface. In-sandbox governance software serves
+`openshell.pip.v1.PolicyInformationPoint` (see `proto/pip.proto`) on a Unix
+domain socket at `/run/openshell/pip/<name>.sock`. The supervisor — never the
+sandbox — initiates the connection, verifies the publisher's binary via
+`SO_PEERCRED` plus a TOFU SHA256 pin, and streams `SecurityContext` messages
+into the `PipCache` owned by the `OpaEngine`.
+
+The watcher task is spawned by `run_networking` when process supervision is
+enabled. It resolves the sandbox root through `/proc/<pid>/root/` (same
+approach as the binary symlink resolver), creates the socket directory with
+mode 0750, and polls it for new publishers. On stream error or publisher
+shutdown the publisher's cached context reverts to null; a TOFU hash mismatch
+refuses the connection and emits an OCSF detection finding.
+
+Every OPA query builds its input through `OpaEngine::input_json_with_pip`,
+which merges the cached properties into `input.pip` (null when no PIP is
+connected). The baked policy (`data/sandbox-policy.rego`) treats PIP context
+as deny-only: `pip_denies_network` currently fires when
+`input.pip.trust_state == "suspended"`, and `allow_network` /
+`network_action` require `not pip_denies_network`. PIP context can never
+expand the allowlist. Prototype follow-ups: authored-policy deny rules that
+reference PIP keys (schema + validator work), per-request L7 evaluation
+against `input.pip`, and tagging PIP-influenced OCSF network events with
+their in-sandbox origin.

@@ -1,0 +1,36 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.pip.v1;
+
+// PolicyInformationPoint is served by application-layer governance software
+// running inside the sandbox (RFC 0019). The supervisor — never the sandbox —
+// initiates the connection over a Unix domain socket at
+// /run/openshell/pip/<name>.sock, verifies the serving binary's identity, and
+// consumes the streamed security context. Published properties may only add
+// deny constraints to network policy; they never expand the allowlist.
+service PolicyInformationPoint {
+  // StreamContext returns the publisher's current security context and keeps
+  // the stream open to push updates as the context changes. The stream ends
+  // when the publisher exits or the supervisor disconnects.
+  rpc StreamContext(StreamContextRequest) returns (stream SecurityContext);
+}
+
+message StreamContextRequest {
+  // Identity of the sandbox the supervisor is asking about. Publishers should
+  // verify it matches the sandbox they run in and refuse to answer otherwise.
+  string sandbox_id = 1;
+}
+
+message SecurityContext {
+  // String key-value properties merged into the OPA input document under
+  // input.pip. Publishers should prefix keys with their framework name (for
+  // example "defenseclaw.scan_status") to avoid collisions. Recommended
+  // well-known keys: data_classification, trust_state, anomaly_score.
+  map<string, string> properties = 1;
+
+  // Optional correlation identifier for audit events.
+  string trace_id = 2;
+}

@@ -73,6 +73,10 @@ pub mod middleware {
     pub use super::generated::openshell::middleware::v1;
 }
 
+pub mod pip {
+    pub use super::generated::openshell::pip::v1;
+}
+
 #[doc(hidden)]
 pub mod pagination {
     pub use super::generated::openshell::internal::pagination::v1;

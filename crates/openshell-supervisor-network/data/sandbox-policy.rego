@@ -15,8 +15,23 @@ process_policy := data.process
 
 # --- Network access decision (queried per-CONNECT request) ---
 
+# --- Policy Information Point (PIP) runtime context ---
+#
+# input.pip carries the merged security-context properties published by
+# PIP-capable governance applications inside the sandbox (RFC 0019). The
+# supervisor verifies the publisher's binary identity and injects the cached
+# context here. PIP context can only restrict network access: these rules
+# deny otherwise-allowed connections and can never expand the allowlist.
+# When no PIP is connected, input.pip is undefined and every rule below is
+# inert, matching pre-PIP behavior.
+
+pip_denies_network if {
+	input.pip.trust_state == "suspended"
+}
+
 allow_network if {
 	network_policy_for_request
+	not pip_denies_network
 }
 
 binary_identity_required if {
@@ -59,6 +74,13 @@ deny_reason := reason if {
 	]
 	count(binary_misses) > 0
 	reason := concat("; ", binary_misses)
+}
+
+deny_reason := "network connections denied by policy information point context (pip trust_state suspended)" if {
+	input.network
+	input.exec
+	network_policy_for_request
+	pip_denies_network
 }
 
 deny_reason := "network connections not allowed by policy" if {
@@ -179,9 +201,11 @@ binary_allowed(policy, exec) if {
 
 default network_action := "deny"
 
-# Explicitly allowed: endpoint + binary match in a network policy → allow.
+# Explicitly allowed: endpoint + binary match in a network policy → allow,
+# unless the PIP runtime context denies the session.
 network_action := "allow" if {
 	network_policy_for_request
+	not pip_denies_network
 }
 
 # --- Authoritative egress authorization snapshot ---

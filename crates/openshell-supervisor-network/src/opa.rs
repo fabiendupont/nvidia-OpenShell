@@ -183,6 +183,10 @@ pub struct OpaEngine {
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
     generation_tx: watch::Sender<u64>,
     fail_closed_reason: RwLock<Option<String>>,
+    /// Cached Policy Information Point (PIP) security context published by
+    /// in-sandbox governance software (RFC 0019). Shared with the watcher
+    /// task; merged into `input.pip` on every evaluation.
+    pip_cache: Arc<crate::pip::PipCache>,
 }
 
 #[cfg(test)]
@@ -317,7 +321,26 @@ impl OpaEngine {
             websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
             generation_tx,
             fail_closed_reason: RwLock::new(None),
+            pip_cache: Arc::new(crate::pip::PipCache::new()),
         }
+    }
+
+    /// The Policy Information Point context cache for this sandbox.
+    ///
+    /// The PIP watcher task (see [`crate::pip::run_pip_watcher`]) publishes
+    /// into this cache; every policy evaluation reads from it.
+    pub fn pip_cache(&self) -> Arc<crate::pip::PipCache> {
+        Arc::clone(&self.pip_cache)
+    }
+
+    /// Build the OPA input document for `input`, merging the cached PIP
+    /// security context as `input.pip` when any publisher is connected.
+    fn input_json_with_pip(&self, input: &NetworkInput) -> serde_json::Value {
+        let mut json = network_input_json(input);
+        if let Some(pip) = self.pip_cache.merged() {
+            json["pip"] = serde_json::Value::Object(pip);
+        }
+        json
     }
 
     /// Whether network authorization requires a workload binary identity.
@@ -536,7 +559,7 @@ impl OpaEngine {
     /// `allow_network` rule, and returns a `PolicyDecision` with the result,
     /// deny reason, and matched policy name.
     pub fn evaluate_network(&self, input: &NetworkInput) -> Result<PolicyDecision> {
-        let input_json = network_input_json(input);
+        let input_json = self.input_json_with_pip(input);
 
         let mut engine = self
             .engine
@@ -607,7 +630,7 @@ impl OpaEngine {
         #[cfg(test)]
         record_test_opa_query();
 
-        let input_json = network_input_json(input);
+        let input_json = self.input_json_with_pip(input);
 
         let mut engine = self
             .engine
@@ -1005,7 +1028,7 @@ impl OpaEngine {
         #[cfg(test)]
         record_test_opa_query();
 
-        let input_json = network_input_json(input);
+        let input_json = self.input_json_with_pip(input);
 
         let mut engine = self
             .engine
@@ -1036,7 +1059,7 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<Vec<regorus::Value>> {
-        let input_json = network_input_json(input);
+        let input_json = self.input_json_with_pip(input);
 
         let mut engine = self
             .engine
@@ -1096,7 +1119,7 @@ impl OpaEngine {
         #[cfg(test)]
         record_test_opa_query();
 
-        let input_json = network_input_json(input);
+        let input_json = self.input_json_with_pip(input);
 
         let mut engine = self
             .engine
@@ -4187,6 +4210,82 @@ process:
             decision.reason
         );
         assert_eq!(decision.matched_policy.as_deref(), Some("claude_code"));
+    }
+
+    #[test]
+    fn pip_trust_state_suspension_denies_otherwise_allowed_egress() {
+        let engine = test_engine();
+        let input = NetworkInput {
+            host: "api.anthropic.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![PathBuf::from("/usr/local/bin/claude")],
+        };
+
+        // Baseline: no PIP connected, input.pip is null, allowlist applies.
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(decision.allowed, "baseline allow expected");
+
+        // A PIP publishes a suspended trust state: the same request is now
+        // denied with a PIP-attributable reason.
+        engine.pip_cache().update(
+            "defenseclaw",
+            std::collections::BTreeMap::from([(
+                "trust_state".to_string(),
+                "suspended".to_string(),
+            )]),
+        );
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(!decision.allowed, "PIP suspension must deny egress");
+        assert!(
+            decision.reason.contains("policy information point"),
+            "deny reason must attribute the PIP, got: {}",
+            decision.reason
+        );
+
+        // Disconnect reverts the context to null and the baseline allowlist
+        // applies unchanged.
+        engine.pip_cache().clear("defenseclaw");
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(decision.allowed, "PIP disconnect must restore baseline");
+
+        // egress_authorization carries the same pip deny through
+        // network_action so the proxy's authoritative path agrees.
+        engine.pip_cache().update(
+            "defenseclaw",
+            std::collections::BTreeMap::from([(
+                "trust_state".to_string(),
+                "suspended".to_string(),
+            )]),
+        );
+        let action = engine.evaluate_network_action(&input).unwrap();
+        assert!(matches!(action, NetworkAction::Deny { .. }));
+    }
+
+    #[test]
+    fn pip_context_never_expands_the_allowlist() {
+        let engine = test_engine();
+        // An endpoint not covered by any policy stays denied regardless of
+        // what a PIP publishes; PIP context can only add deny constraints.
+        let input = NetworkInput {
+            host: "evil.example.test".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        engine.pip_cache().update(
+            "nemoclaw",
+            std::collections::BTreeMap::from([
+                ("trust_state".to_string(), "trusted".to_string()),
+                ("data_classification".to_string(), "public".to_string()),
+            ]),
+        );
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(!decision.allowed, "PIP context must never allow egress");
     }
 
     #[test]

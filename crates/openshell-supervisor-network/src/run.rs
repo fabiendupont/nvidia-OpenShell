@@ -309,6 +309,8 @@ pub async fn run_networking(
         denial_log,
         proxy_tls,
     } = instance;
+    // Saved before `sandbox_name.or(sandbox_id)` consumes the value below.
+    let pip_sandbox_id = sandbox_id.clone();
     let token_grants = SpiffeTokenGrantResolver::new(SandboxInstanceTokenGrants::new(
         gateway.clone(),
         sandbox_id.clone(),
@@ -422,6 +424,25 @@ pub async fn run_networking(
     } else {
         // No symlink resolution needed — unblock the proxy immediately.
         let _ = engine_ready_tx.send(true);
+    }
+
+    // Spawn the Policy Information Point (PIP) watcher (RFC 0019). The
+    // watcher connects to governance-framework sockets under
+    // /run/openshell/pip/ inside the sandbox and streams their security
+    // context into the OPA engine's PIP cache. Failure to find any PIP is
+    // the normal case for sandboxes without PIP-capable applications; the
+    // task exits quietly and input.pip stays null.
+    if let Some(engine) = opa_engine
+        && process_enabled
+    {
+        let pip_cache = engine.pip_cache();
+        let pip_pid = entrypoint_pid.clone();
+        let pip_sandbox_id = pip_sandbox_id.unwrap_or_default();
+        tokio::spawn(crate::pip::run_pip_watcher(
+            pip_cache,
+            pip_pid,
+            pip_sandbox_id,
+        ));
     }
 
     // Identity cache for SHA256 TOFU when OPA is active. Only consumed by
