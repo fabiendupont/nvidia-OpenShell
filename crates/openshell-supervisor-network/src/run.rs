@@ -428,13 +428,13 @@ pub async fn run_networking(
 
     // Spawn the Policy Information Point (PIP) watcher (RFC 0019). The
     // watcher connects to governance-framework sockets under
-    // /run/openshell/pip/ inside the sandbox and streams their security
-    // context into the OPA engine's PIP cache. Failure to find any PIP is
-    // the normal case for sandboxes without PIP-capable applications; the
-    // task exits quietly and input.pip stays null.
-    if let Some(engine) = opa_engine
-        && process_enabled
-    {
+    // /run/openshell/pip/ inside the sandbox and to operator-side publishers
+    // (same-host sockets and configured remote endpoints), streaming their
+    // security context into the OPA engine's PIP cache. In-sandbox
+    // publishers need process supervision to publish an entrypoint PID;
+    // operator-side publishers work without it. Finding no publisher at all
+    // is the normal case; input.pip stays null.
+    if let Some(engine) = opa_engine {
         let pip_cache = engine.pip_cache();
         let pip_pid = entrypoint_pid.clone();
         let pip_sandbox_id = pip_sandbox_id.unwrap_or_default();

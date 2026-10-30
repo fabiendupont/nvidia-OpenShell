@@ -379,6 +379,8 @@ mod tests {
             binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
+            pip: None,
+            pip_influenced: false,
         }
     }
 

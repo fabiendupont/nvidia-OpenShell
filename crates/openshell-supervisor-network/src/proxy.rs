@@ -1602,21 +1602,47 @@ fn emit_transparent_policy_denial(
     let pid = decision
         .binary_pid
         .map_or_else(|| "-".to_string(), |pid| pid.to_string());
-    egress_emit!(
-        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Open)
-            .action(ActionId::Denied)
-            .disposition(DispositionId::Blocked)
-            .severity(SeverityId::Medium)
-            .status(StatusId::Failure)
-            .dst_endpoint(Endpoint::from_domain(host, port))
-            .src_endpoint_addr(workload.ip(), workload.port())
-            .actor_process(Process::from_bypass(&binary, &pid, "-"))
-            .firewall_rule("-", "opa")
-            .message(format!("Transparent TCP denied {host}:{port}"))
-            .status_detail(status_detail)
-            .build()
-    );
+    let mut builder = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .src_endpoint_addr(workload.ip(), workload.port())
+        .actor_process(Process::from_bypass(&binary, &pid, "-"))
+        .firewall_rule("-", "opa")
+        .message(format!("Transparent TCP denied {host}:{port}"))
+        .status_detail(status_detail);
+    // Tag PIP-influenced denials with the published context and each
+    // publisher's origin so analysts can weight in-sandbox-sourced evidence
+    // accordingly (RFC 0019).
+    if decision.pip_influenced
+        && let Some(pip) = &decision.pip
+    {
+        let origins: Vec<&str> = pip
+            .publishers
+            .iter()
+            .map(|(_, origin)| origin.as_str())
+            .collect();
+        builder = builder
+            .unmapped("pip_influenced", serde_json::json!(true))
+            .unmapped(
+                "pip_publishers",
+                serde_json::json!(
+                    pip.publishers
+                        .iter()
+                        .map(|(name, origin)| (name, origin.as_str()))
+                        .collect::<Vec<_>>()
+                ),
+            )
+            .unmapped("pip_origins", serde_json::json!(origins))
+            .unmapped(
+                "pip_context",
+                serde_json::Value::Object(pip.properties.clone()),
+            );
+    }
+    egress_emit!(builder.build());
 }
 
 const MAX_CONSECUTIVE_UNKNOWN_ACCEPT_ERRORS: u32 = 10;
@@ -3743,6 +3769,8 @@ fn authorize_egress_intent_inner(
             binary_pid,
             ancestors,
             cmdline_paths,
+            pip: None,
+            pip_influenced: false,
         }
     };
 
@@ -3800,6 +3828,8 @@ fn authorize_egress_intent_inner(
             binary_pid: Some(binary_pid),
             ancestors,
             cmdline_paths,
+            pip: authorization.pip.clone(),
+            pip_influenced: authorization.pip_influenced,
         },
         Err(e) => deny(
             format!("policy evaluation error: {e}"),
@@ -3848,6 +3878,8 @@ fn evaluate_endpoint_only_opa_inner(engine: &OpaEngine, intent: EgressIntent) ->
             binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
+            pip: authorization.pip.clone(),
+            pip_influenced: authorization.pip_influenced,
         },
         Err(e) => EgressDecision {
             intent,
@@ -3863,6 +3895,8 @@ fn evaluate_endpoint_only_opa_inner(engine: &OpaEngine, intent: EgressIntent) ->
             binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
+            pip: None,
+            pip_influenced: false,
         },
     }
 }
@@ -3924,6 +3958,8 @@ fn authorize_supplied_identity_with_denial_inner(
         binary_pid: None,
         ancestors,
         cmdline_paths,
+        pip: None,
+        pip_influenced: false,
     };
 
     let identity = match identity {
@@ -3983,6 +4019,8 @@ fn authorize_supplied_identity_with_denial_inner(
             binary_pid: None,
             ancestors: ancestor_paths,
             cmdline_paths: identity.cmdline_paths.clone(),
+            pip: authorization.pip.clone(),
+            pip_influenced: authorization.pip_influenced,
         },
         Err(error) => deny(
             format!("policy evaluation error: {error}"),
@@ -4020,6 +4058,8 @@ fn authorize_egress_intent_inner(
         binary_pid: None,
         ancestors: vec![],
         cmdline_paths: vec![],
+        pip: None,
+        pip_influenced: false,
     }
 }
 
@@ -7315,6 +7355,90 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn transparent_policy_denial_tags_pip_origin() {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+
+        let decision = EgressDecision {
+            intent: EgressIntent::connect("api.anthropic.com".to_string(), 443),
+            action: crate::opa::NetworkAction::Deny {
+                reason:
+                    "network connections denied by policy information point context (pip trust_state suspended)"
+                        .to_string(),
+            },
+            policy_generation: 1,
+            identity: ProcessIdentityEvidence::Available,
+            endpoint: EndpointDecision::default(),
+            binary: Some(PathBuf::from("/usr/bin/node")),
+            binary_pid: Some(42),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            pip: Some(crate::pip::PipSnapshot {
+                publishers: vec![
+                    ("defenseclaw".to_string(), crate::pip::PipOrigin::Sandbox),
+                    ("navra".to_string(), crate::pip::PipOrigin::OperatorHost),
+                ],
+                properties: serde_json::Map::from_iter([(
+                    "trust_state".to_string(),
+                    serde_json::json!("suspended"),
+                )]),
+            }),
+            pip_influenced: true,
+        };
+        let workload: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        emit_transparent_policy_denial(&decision, workload, "api.anthropic.com", 443);
+
+        let events = capture.json_events();
+        let event = events
+            .last()
+            .expect("PIP-influenced denial must emit an OCSF event");
+        assert_eq!(event["unmapped"]["pip_influenced"], serde_json::json!(true));
+        assert_eq!(
+            event["unmapped"]["pip_origins"],
+            serde_json::json!(["sandbox", "operator_host"])
+        );
+        assert_eq!(
+            event["unmapped"]["pip_publishers"],
+            serde_json::json!([["defenseclaw", "sandbox"], ["navra", "operator_host"]])
+        );
+        assert_eq!(
+            event["unmapped"]["pip_context"]["trust_state"],
+            serde_json::json!("suspended")
+        );
+    }
+
+    #[test]
+    fn transparent_policy_denial_without_pip_tags_nothing() {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+
+        let decision = EgressDecision {
+            intent: EgressIntent::connect("api.anthropic.com".to_string(), 443),
+            action: crate::opa::NetworkAction::Deny {
+                reason: "endpoint not allowed".to_string(),
+            },
+            policy_generation: 1,
+            identity: ProcessIdentityEvidence::Available,
+            endpoint: EndpointDecision::default(),
+            binary: None,
+            binary_pid: None,
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            pip: None,
+            pip_influenced: false,
+        };
+        let workload: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        emit_transparent_policy_denial(&decision, workload, "api.anthropic.com", 443);
+
+        let events = capture.json_events();
+        let event = events.last().expect("denial event emitted");
+        assert!(
+            event["unmapped"].get("pip_influenced").is_none(),
+            "non-PIP denials must not carry PIP tags"
+        );
+    }
 
     // These contract tests use host-native absolute identities and matching
     // policy declarations. Relative-path rejection remains independently tested.
@@ -11941,6 +12065,8 @@ network_policies:
             binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
+            pip: authorization.pip.clone(),
+            pip_influenced: authorization.pip_influenced,
         };
         let route = query_l7_route_snapshot(&decision, host, port).expect("L7 route should match");
         let config = select_l7_config_for_path(&route.configs, path)
@@ -15564,6 +15690,8 @@ network_policies:
                 binary_pid: Some(1),
                 ancestors: vec![],
                 cmdline_paths: vec![],
+                pip: authorization.pip.clone(),
+                pip_influenced: authorization.pip_influenced,
             };
             query_tls_mode(&decision, "203.0.113.10", 443)
         };

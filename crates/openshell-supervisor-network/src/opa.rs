@@ -112,6 +112,12 @@ pub struct EgressAuthorization {
     pub matched_endpoints: Vec<MatchedEndpoint>,
     pub exact_declared_endpoint_host: bool,
     pub generation: u64,
+    /// Published PIP context at decision time, captured on denials so OCSF
+    /// events can attribute the influence and origin (RFC 0019). `None` on
+    /// allows and when no publisher is connected.
+    pub pip: Option<crate::pip::PipSnapshot>,
+    /// Whether the `pip_denies_network` rule fired for this denial.
+    pub pip_influenced: bool,
 }
 
 /// Input for a network access policy evaluation.
@@ -650,6 +656,8 @@ impl OpaEngine {
                 matched_endpoints: Vec::new(),
                 exact_declared_endpoint_host: false,
                 generation,
+                pip: None,
+                pip_influenced: false,
             });
         }
 
@@ -683,12 +691,30 @@ impl OpaEngine {
             }
         };
 
+        // On denials, capture the published PIP context and whether it
+        // influenced the decision so audit events can tag the origin. The
+        // input document (including input.pip) is still set on the engine.
+        let (pip, pip_influenced) = if matches!(action, NetworkAction::Deny { .. }) {
+            let snapshot = self.pip_cache.snapshot();
+            let influenced = snapshot.is_some() && {
+                let val = engine
+                    .eval_rule("data.openshell.sandbox.pip_denies_network".into())
+                    .map_err(|e| miette::miette!("{e}"))?;
+                val == regorus::Value::from(true)
+            };
+            (snapshot, influenced)
+        } else {
+            (None, false)
+        };
+
         Ok(EgressAuthorization {
             action,
             endpoint_configs,
             matched_endpoints,
             exact_declared_endpoint_host,
             generation,
+            pip,
+            pip_influenced,
         })
     }
 
@@ -4232,6 +4258,7 @@ process:
         // denied with a PIP-attributable reason.
         engine.pip_cache().update(
             "defenseclaw",
+            crate::pip::PipOrigin::Sandbox,
             std::collections::BTreeMap::from([(
                 "trust_state".to_string(),
                 "suspended".to_string(),
@@ -4255,6 +4282,7 @@ process:
         // network_action so the proxy's authoritative path agrees.
         engine.pip_cache().update(
             "defenseclaw",
+            crate::pip::PipOrigin::Sandbox,
             std::collections::BTreeMap::from([(
                 "trust_state".to_string(),
                 "suspended".to_string(),
@@ -4262,6 +4290,23 @@ process:
         );
         let action = engine.evaluate_network_action(&input).unwrap();
         assert!(matches!(action, NetworkAction::Deny { .. }));
+
+        // The authorization snapshot tags the denial as PIP-influenced and
+        // carries the publishers for OCSF origin attribution.
+        let authorization = engine.authorize_egress(&input).unwrap();
+        assert!(authorization.pip_influenced);
+        let pip = authorization.pip.expect("pip snapshot on denial");
+        assert_eq!(
+            pip.publishers,
+            vec![("defenseclaw".to_string(), crate::pip::PipOrigin::Sandbox)]
+        );
+        assert_eq!(pip.properties["trust_state"], "suspended");
+
+        // Allows never carry a snapshot.
+        engine.pip_cache().clear("defenseclaw");
+        let authorization = engine.authorize_egress(&input).unwrap();
+        assert!(!authorization.pip_influenced);
+        assert!(authorization.pip.is_none());
     }
 
     #[test]
@@ -4279,6 +4324,7 @@ process:
         };
         engine.pip_cache().update(
             "nemoclaw",
+            crate::pip::PipOrigin::OperatorHost,
             std::collections::BTreeMap::from([
                 ("trust_state".to_string(), "trusted".to_string()),
                 ("data_classification".to_string(), "public".to_string()),

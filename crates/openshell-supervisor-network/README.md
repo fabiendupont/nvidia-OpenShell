@@ -55,27 +55,47 @@ signing retains the endpoint-scoped resolver's existing trusted access.
 ## Policy Information Point (RFC 0019, prototype)
 
 `pip.rs` implements the supervisor side of the Policy Information Point
-interface. In-sandbox governance software serves
-`openshell.pip.v1.PolicyInformationPoint` (see `proto/pip.proto`) on a Unix
-domain socket at `/run/openshell/pip/<name>.sock`. The supervisor — never the
-sandbox — initiates the connection, verifies the publisher's binary via
-`SO_PEERCRED` plus a TOFU SHA256 pin, and streams `SecurityContext` messages
-into the `PipCache` owned by the `OpaEngine`.
+interface: governance software publishes per-sandbox security context that
+network policy acts on, merged into the OPA input document as `input.pip`.
+The supervisor — never the sandbox or the publisher — initiates every
+connection. Three publisher classes share one contract
+(`openshell.pip.v1.PolicyInformationPoint`, `proto/pip.proto`):
 
-The watcher task is spawned by `run_networking` when process supervision is
-enabled. It resolves the sandbox root through `/proc/<pid>/root/` (same
-approach as the binary symlink resolver), creates the socket directory with
-mode 0750, and polls it for new publishers. On stream error or publisher
-shutdown the publisher's cached context reverts to null; a TOFU hash mismatch
-refuses the connection and emits an OCSF detection finding.
+- **In-sandbox publishers** serve on a Unix domain socket at
+  `/run/openshell/pip/<name>.sock` inside the sandbox, discovered through
+  `/proc/<pid>/root/`. Zero configuration.
+- **Operator-side publishers (same host)** serve the identical contract under
+  `/run/openshell-supervisor/pip/<sandbox-id>/` (override the root with
+  `OPENSHELL_PIP_HOST_DIR`). The directory is created with mode 0750.
+- **Remote publishers** are operator-configured gRPC endpoints
+  (`OPENSHELL_PIP_REMOTE_ENDPOINTS`, comma-separated; `https://` endpoints
+  take a CA bundle via `OPENSHELL_PIP_REMOTE_CA_CERT`). Configuring the list
+  is the configuration-time authorization for those publishers.
 
-Every OPA query builds its input through `OpaEngine::input_json_with_pip`,
-which merges the cached properties into `input.pip` (null when no PIP is
-connected). The baked policy (`data/sandbox-policy.rego`) treats PIP context
-as deny-only: `pip_denies_network` currently fires when
+Unix-socket publishers (in-sandbox and same-host operator) are verified via
+`SO_PEERCRED` plus a TOFU SHA256 pin of the `/proc`-resolved executable; a
+mismatch refuses the connection and emits an OCSF detection finding. On
+stream error or publisher shutdown the cached context reverts to null
+(fail-closed); an absent or empty publisher is equivalent to no publisher,
+so baseline policy applies unchanged.
+
+The watcher tasks are spawned by `run_networking` whenever the OPA engine is
+active. Every OPA query builds its input through
+`OpaEngine::input_json_with_pip`, which merges the cached properties into
+`input.pip` (null when no publisher is connected). The baked policy
+(`data/sandbox-policy.rego`) treats PIP context as deny-only:
+`pip_denies_network` currently fires when
 `input.pip.trust_state == "suspended"`, and `allow_network` /
 `network_action` require `not pip_denies_network`. PIP context can never
-expand the allowlist. Prototype follow-ups: authored-policy deny rules that
-reference PIP keys (schema + validator work), per-request L7 evaluation
-against `input.pip`, and tagging PIP-influenced OCSF network events with
-their in-sandbox origin.
+expand the allowlist.
+
+Denial attribution: `EgressAuthorization` captures a `PipSnapshot`
+(publishers with origins, merged properties) and a `pip_influenced` flag on
+denials, and the transparent-TCP denial OCSF event tags
+`pip_influenced`/`pip_publishers`/`pip_origins`/`pip_context` when the deny
+rule fired, so analysts can weight in-sandbox-sourced evidence accordingly.
+Prototype follow-ups: authored-policy deny rules that reference PIP keys
+(schema + validator work, including rejecting `input.pip` in allow rules),
+per-request L7 evaluation against `input.pip`, PIP tags on the remaining
+denial emitters, and gateway TOML registration for remote publishers
+mirroring `[[openshell.supervisor.middleware]]`.

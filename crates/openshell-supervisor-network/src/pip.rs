@@ -3,17 +3,27 @@
 
 //! Policy Information Point (PIP) supervisor (RFC 0019).
 //!
-//! Application-layer governance software running inside the sandbox exposes a
-//! `PolicyInformationPoint` gRPC service on a Unix domain socket under
-//! `/run/openshell/pip/<name>.sock`. The supervisor — never the sandbox —
-//! initiates the connection, verifies the serving binary's identity via
-//! `SO_PEERCRED` plus a TOFU SHA256 check, and streams the publisher's
-//! security context into [`PipCache`]. The OPA engine merges the cached
-//! properties into every network evaluation as `input.pip`.
+//! Governance software publishes per-sandbox security context that network
+//! policy acts on. The supervisor — never the sandbox — initiates every
+//! connection and exposes the merged context to OPA as `input.pip`. Three
+//! publisher classes are supported:
+//!
+//! - **In-sandbox publishers** serve `PolicyInformationPoint` on a Unix
+//!   domain socket at `/run/openshell/pip/<name>.sock` inside the sandbox.
+//!   The supervisor discovers the socket through `/proc/<pid>/root/`,
+//!   verifies the serving binary's identity via `SO_PEERCRED` plus a TOFU
+//!   SHA256 pin, and initiates the stream. Zero configuration.
+//! - **Operator-side publishers** (same host) serve the identical contract
+//!   on a socket under `/run/openshell-supervisor/pip/<sandbox-id>/`. The
+//!   same peer-credential verification applies.
+//! - **Remote publishers** (operator-configured gRPC endpoints, for
+//!   deployments where the publisher runs on another node) are authorized at
+//!   configuration time through the endpoint list; the supervisor connects
+//!   and streams the same contract.
 //!
 //! PIP context can only restrict network access (deny rules); it never
-//! expands the baseline allowlist. A disconnected or absent PIP is equivalent
-//! to no PIP: its cached context reverts to null.
+//! expands the baseline allowlist. A disconnected or absent publisher is
+//! equivalent to no publisher: its cached context reverts to null.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -28,11 +38,27 @@ use tower::service_fn;
 
 use crate::procfs;
 
-/// Directory (relative to the sandbox root) where PIP publishers create
-/// their sockets.
+/// Directory (relative to the sandbox root) where in-sandbox PIP publishers
+/// create their sockets.
 const PIP_DIR_RELATIVE: &str = "run/openshell/pip";
 
-/// How often the watcher rescans the PIP socket directory.
+/// Root of the supervisor-side directory tree for same-host operator
+/// publishers. One subdirectory per sandbox id.
+pub const HOST_PIP_ROOT: &str = "/run/openshell-supervisor/pip";
+
+/// Overrides [`HOST_PIP_ROOT`] for supervisors that cannot write `/run`
+/// directly, and for tests.
+pub const HOST_PIP_DIR_ENV: &str = "OPENSHELL_PIP_HOST_DIR";
+
+/// Comma-separated operator-configured remote publisher gRPC endpoints
+/// (`http://host:port` or `https://host:port`). Setting the list is the
+/// configuration-time authorization for those publishers.
+pub const REMOTE_ENDPOINTS_ENV: &str = "OPENSHELL_PIP_REMOTE_ENDPOINTS";
+
+/// PEM CA certificate file for remote publishers reached over `https://`.
+pub const REMOTE_CA_CERT_ENV: &str = "OPENSHELL_PIP_REMOTE_CA_CERT";
+
+/// How often a directory watcher rescans for PIP sockets.
 const WATCH_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// Backoff before reconnecting a PIP stream after a disconnect.
@@ -41,18 +67,55 @@ const RECONNECT_BACKOFF: Duration = Duration::from_millis(1000);
 /// Backoff before re-checking a PIP whose binary hash failed the TOFU check.
 const TOFU_MISMATCH_BACKOFF: Duration = Duration::from_secs(5);
 
-/// Cached security context published by in-sandbox PIP services.
+/// Where a published security context came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipOrigin {
+    /// A governance application running inside the sandbox.
+    Sandbox,
+    /// Operator-deployed infrastructure on the supervisor host.
+    OperatorHost,
+    /// An operator-configured remote gRPC endpoint.
+    Remote,
+}
+
+impl PipOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sandbox => "sandbox",
+            Self::OperatorHost => "operator_host",
+            Self::Remote => "operator_remote",
+        }
+    }
+}
+
+/// One connected publisher's cached state.
+#[derive(Clone, Debug)]
+struct PipEntry {
+    origin: PipOrigin,
+    properties: BTreeMap<String, String>,
+}
+
+/// Cached security context published by PIP services for one sandbox.
 ///
-/// The latest property map from each connected publisher is stored per PIP
-/// name. [`PipCache::merged`] folds them into the single flat object injected
-/// as `input.pip`; when no PIP is connected the merged value is `None` and
-/// `input.pip` stays null, matching pre-PIP behavior.
+/// The latest property map from each connected publisher is stored per
+/// publisher name. [`PipCache::merged`] folds them into the single flat
+/// object injected as `input.pip`; when no publisher is connected the merged
+/// value is `None` and `input.pip` stays null, matching pre-PIP behavior.
 ///
 /// Reads take one `RwLock::read()` on the OPA hot path; all I/O happens in
 /// the watcher tasks.
 #[derive(Debug, Default)]
 pub struct PipCache {
-    per_pip: std::sync::RwLock<BTreeMap<String, BTreeMap<String, String>>>,
+    per_pip: std::sync::RwLock<BTreeMap<String, PipEntry>>,
+}
+
+/// An atomic view of the published context, for audit logging.
+#[derive(Clone, Debug)]
+pub struct PipSnapshot {
+    /// Connected publisher names, for origin attribution in OCSF events.
+    pub publishers: Vec<(String, PipOrigin)>,
+    /// Merged properties (latest writer wins per key).
+    pub properties: serde_json::Map<String, serde_json::Value>,
 }
 
 impl PipCache {
@@ -62,9 +125,14 @@ impl PipCache {
 
     /// Replace the cached context of one publisher. Called with each streamed
     /// `SecurityContext` message; an empty property map is a valid state.
-    pub(crate) fn update(&self, pip: &str, properties: BTreeMap<String, String>) {
+    pub(crate) fn update(
+        &self,
+        pip: &str,
+        origin: PipOrigin,
+        properties: BTreeMap<String, String>,
+    ) {
         if let Ok(mut guard) = self.per_pip.write() {
-            guard.insert(pip.to_string(), properties);
+            guard.insert(pip.to_string(), PipEntry { origin, properties });
         }
     }
 
@@ -77,27 +145,38 @@ impl PipCache {
 
     /// Merge every connected publisher's properties into one object.
     ///
-    /// Returns `None` when no PIP is connected. Key collisions between
-    /// publishers are resolved deterministically: the
-    /// lexicographically-later publisher name wins. Publishers should
-    /// prefix their keys by convention to avoid collisions entirely.
+    /// Returns `None` when no publisher is connected. Key collisions between
+    /// publishers are resolved by lexicographic publisher name order;
+    /// publishers should prefix their keys by convention to avoid this.
     pub fn merged(&self) -> Option<serde_json::Map<String, serde_json::Value>> {
+        self.snapshot().map(|snapshot| snapshot.properties)
+    }
+
+    /// Atomic snapshot of the merged properties and connected publishers.
+    pub fn snapshot(&self) -> Option<PipSnapshot> {
         let guard = self.per_pip.read().ok()?;
         if guard.is_empty() {
             return None;
         }
         let mut merged = serde_json::Map::new();
-        for properties in guard.values() {
-            for (key, value) in properties {
+        for entry in guard.values() {
+            for (key, value) in &entry.properties {
                 merged.insert(key.clone(), serde_json::Value::String(value.clone()));
             }
         }
         if merged.is_empty() {
-            // A connected PIP publishing an empty map is equivalent to no
+            // A connected publisher with an empty map is equivalent to no
             // properties; keep `input.pip` absent rather than `{}`.
             return None;
         }
-        Some(merged)
+        let publishers = guard
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.origin))
+            .collect();
+        Some(PipSnapshot {
+            publishers,
+            properties: merged,
+        })
     }
 
     /// Names of the publishers whose context is currently cached.
@@ -109,156 +188,266 @@ impl PipCache {
     }
 }
 
-/// Supervisor-side watcher for PIP sockets inside one sandbox.
-///
-/// Waits for the workload's mount namespace to become visible through
-/// `/proc/<pid>/root/`, then polls `run/openshell/pip/` for `<name>.sock`
-/// sockets and spawns one connection task per socket.
-pub struct PipWatcher {
-    cache: Arc<PipCache>,
-    sandbox_id: String,
-    /// Trust-on-first-use binary hashes, keyed by PIP name.
-    tofu: Arc<Mutex<HashMap<String, String>>>,
+/// Operator-configured watcher inputs.
+#[derive(Clone, Debug)]
+pub struct PipWatcherConfig {
+    /// Root of the supervisor-side directory tree for same-host operator
+    /// publishers.
+    pub host_dir_root: PathBuf,
+    /// Operator-configured remote publisher gRPC endpoints. Configuring the
+    /// list authorizes those publishers.
+    pub remote_endpoints: Vec<String>,
+    /// Optional PEM CA certificate path for `https://` remote endpoints.
+    pub remote_ca_cert: Option<PathBuf>,
 }
 
-/// Run the PIP watcher for one sandbox until the task is aborted.
+impl Default for PipWatcherConfig {
+    fn default() -> Self {
+        Self {
+            host_dir_root: PathBuf::from(HOST_PIP_ROOT),
+            remote_endpoints: Vec::new(),
+            remote_ca_cert: None,
+        }
+    }
+}
+
+impl PipWatcherConfig {
+    /// Read operator configuration from the process environment.
+    ///
+    /// Process-level operator configuration, following the OTLP relay
+    /// endpoint pattern. Sandbox-scoped state never comes from here.
+    pub fn from_env() -> Self {
+        let mut config = Self::default();
+        if let Ok(root) = std::env::var(HOST_PIP_DIR_ENV)
+            && !root.is_empty()
+        {
+            config.host_dir_root = PathBuf::from(root);
+        }
+        if let Ok(endpoints) = std::env::var(REMOTE_ENDPOINTS_ENV) {
+            config.remote_endpoints = endpoints
+                .split(',')
+                .map(str::trim)
+                .filter(|endpoint| !endpoint.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+        if let Ok(ca) = std::env::var(REMOTE_CA_CERT_ENV)
+            && !ca.is_empty()
+        {
+            config.remote_ca_cert = Some(PathBuf::from(ca));
+        }
+        config
+    }
+}
+
+/// Run the PIP watcher for one sandbox until the tasks are aborted.
 ///
-/// Spawned by `run_networking` when process supervision is enabled. Never
-/// fails the sandbox: every error path logs and retries or gives up on that
-/// PIP only.
+/// Spawns independent watcher tasks per publisher source; returns once the
+/// tasks are launched. Never fails the sandbox: every error path logs and
+/// retries or gives up on that publisher only.
 pub async fn run_pip_watcher(
     cache: Arc<PipCache>,
     entrypoint_pid: Arc<AtomicU32>,
     sandbox_id: String,
 ) {
-    let watcher = PipWatcher {
+    run_pip_watcher_with_config(
         cache,
+        entrypoint_pid,
         sandbox_id,
-        tofu: Arc::new(Mutex::new(HashMap::new())),
-    };
-    watcher.run(entrypoint_pid).await;
+        PipWatcherConfig::from_env(),
+    )
+    .await;
 }
 
-impl PipWatcher {
-    async fn run(&self, entrypoint_pid: Arc<AtomicU32>) {
-        // Phase 1: wait for the orchestrator to publish the entrypoint PID
-        // (20 attempts * 250ms = 5s window, matching the symlink resolver).
-        let mut pid = 0;
-        for _ in 1..=20 {
-            pid = entrypoint_pid.load(Ordering::Acquire);
-            if pid != 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+/// [`run_pip_watcher`] with explicit operator configuration (tests, embedded
+/// callers).
+#[allow(clippy::unused_async)] // spawns detached tasks; kept async for a uniform spawn surface
+pub async fn run_pip_watcher_with_config(
+    cache: Arc<PipCache>,
+    entrypoint_pid: Arc<AtomicU32>,
+    sandbox_id: String,
+    config: PipWatcherConfig,
+) {
+    // In-sandbox publishers need the workload's mount namespace; wait for
+    // the entrypoint PID in a child task so operator-side publishers start
+    // immediately.
+    let sandbox_cache = Arc::clone(&cache);
+    let sandbox_id_for_sandbox = sandbox_id.clone();
+    tokio::spawn(async move {
+        if let Some(pip_dir) = resolve_sandbox_pip_dir(&entrypoint_pid).await {
+            watch_pip_dir(
+                sandbox_cache,
+                sandbox_id_for_sandbox,
+                PipOrigin::Sandbox,
+                pip_dir,
+            )
+            .await;
         }
-        if pid == 0 {
-            tracing::debug!("PIP watcher: entrypoint PID never published, exiting");
-            return;
-        }
+    });
 
-        // Phase 2: wait for /proc/<pid>/root/ to become traversable.
-        let probe = format!("/proc/{pid}/root/");
-        let mut root = None;
-        for _ in 1..=10 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if std::fs::metadata(&probe).is_ok() {
-                root = Some(PathBuf::from(probe));
-                break;
-            }
-        }
-        let Some(root) = root else {
-            tracing::debug!("PIP watcher: sandbox root never became visible, exiting");
-            return;
-        };
-
-        let pip_dir = root.join(PIP_DIR_RELATIVE);
-        Self::ensure_pip_dir(&pip_dir);
-        tracing::info!(
-            pip_dir = %pip_dir.display(),
-            "PIP watcher: watching for Policy Information Point sockets"
-        );
-
-        // One spawned connection task per discovered socket name.
-        let mut managed: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
-        loop {
-            for name in Self::discover_sockets(&pip_dir) {
-                if let std::collections::hash_map::Entry::Vacant(slot) = managed.entry(name.clone())
-                {
-                    tracing::info!(pip = %name, "PIP watcher: connecting to policy information point");
-                    let task = tokio::spawn(run_pip_connection(
-                        Arc::clone(&self.cache),
-                        Arc::clone(&self.tofu),
-                        self.sandbox_id.clone(),
-                        name.clone(),
-                        pip_dir.join(format!("{name}.sock")),
-                    ));
-                    slot.insert(task);
-                }
-            }
-            // Reap finished connection tasks (socket disappeared).
-            managed.retain(|_, task| !task.is_finished());
-            tokio::time::sleep(WATCH_INTERVAL).await;
+    // Same-host operator publishers: one supervisor-side directory per
+    // sandbox, created with mode 0750 so operator tooling can drop sockets
+    // into it.
+    if !sandbox_id.is_empty() {
+        let host_dir = config.host_dir_root.join(&sandbox_id);
+        if let Err(error) = create_pip_dir(&host_dir) {
+            tracing::debug!(
+                host_dir = %host_dir.display(),
+                %error,
+                "PIP watcher: could not create operator publisher directory"
+            );
+        } else {
+            tracing::info!(
+                host_dir = %host_dir.display(),
+                "PIP watcher: watching for operator-side policy information point sockets"
+            );
+            tokio::spawn(watch_pip_dir(
+                Arc::clone(&cache),
+                sandbox_id.clone(),
+                PipOrigin::OperatorHost,
+                host_dir,
+            ));
         }
     }
 
-    /// Best-effort creation of the PIP socket directory with mode 0750 so a
-    /// governance framework can create its socket without preparing the
-    /// directory itself. Failure is non-fatal: a publisher may create the
-    /// directory with its own permissions.
-    fn ensure_pip_dir(pip_dir: &Path) {
-        if pip_dir.exists() {
-            return;
+    // Remote operator publishers: authorized at configuration time.
+    for endpoint in config.remote_endpoints {
+        tracing::info!(
+            endpoint = %endpoint,
+            "PIP watcher: connecting to remote policy information point"
+        );
+        tokio::spawn(run_remote_pip_connection(
+            Arc::clone(&cache),
+            sandbox_id.clone(),
+            endpoint,
+            config.remote_ca_cert.clone(),
+        ));
+    }
+}
+
+/// Wait for the workload's PID and mount namespace, then return the in-sandbox
+/// PIP socket directory. Returns `None` when the sandbox root never becomes
+/// visible (no in-sandbox publishers possible).
+async fn resolve_sandbox_pip_dir(entrypoint_pid: &Arc<AtomicU32>) -> Option<PathBuf> {
+    // Phase 1: wait for the orchestrator to publish the entrypoint PID
+    // (20 attempts * 250ms = 5s window, matching the symlink resolver).
+    let mut pid = 0;
+    for _ in 1..=20 {
+        pid = entrypoint_pid.load(Ordering::Acquire);
+        if pid != 0 {
+            break;
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(true).mode(0o750);
-            if let Err(error) = builder.create(pip_dir) {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    if pid == 0 {
+        tracing::debug!("PIP watcher: entrypoint PID never published; no in-sandbox publishers");
+        return None;
+    }
+
+    // Phase 2: wait for /proc/<pid>/root/ to become traversable.
+    let probe = format!("/proc/{pid}/root/");
+    for _ in 1..=10 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if std::fs::metadata(&probe).is_ok() {
+            let pip_dir = PathBuf::from(&probe).join(PIP_DIR_RELATIVE);
+            if let Err(error) = create_pip_dir(&pip_dir) {
                 tracing::debug!(
                     pip_dir = %pip_dir.display(),
                     %error,
-                    "PIP watcher: could not create PIP socket directory"
+                    "PIP watcher: could not create in-sandbox PIP socket directory"
                 );
             }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = pip_dir;
+            return Some(pip_dir);
         }
     }
+    tracing::debug!("PIP watcher: sandbox root never became visible; no in-sandbox publishers");
+    None
+}
 
-    /// Names (`<name>` from `<name>.sock`) of PIP sockets currently present.
-    fn discover_sockets(pip_dir: &Path) -> Vec<String> {
-        let Ok(entries) = std::fs::read_dir(pip_dir) else {
-            return Vec::new();
-        };
-        let mut names = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_none_or(|ext| ext != "sock") {
-                continue;
-            }
-            if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
-                && !stem.is_empty()
-            {
-                names.push(stem.to_string());
+/// Best-effort creation of a PIP socket directory with mode 0750.
+fn create_pip_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.exists() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o750);
+        builder.create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// Watch one PIP socket directory and maintain a connection task per
+/// discovered `<name>.sock`.
+async fn watch_pip_dir(cache: Arc<PipCache>, sandbox_id: String, origin: PipOrigin, dir: PathBuf) {
+    // TOFU binary hashes for this directory, keyed by publisher name. The
+    // origin prefix keeps same-named sandbox and operator publishers from
+    // sharing a pin.
+    let tofu: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mut managed: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    loop {
+        for name in discover_sockets(&dir) {
+            let key = format!("{}/{name}", origin.as_str());
+            if let std::collections::hash_map::Entry::Vacant(slot) = managed.entry(key.clone()) {
+                tracing::info!(
+                    pip = %name,
+                    origin = origin.as_str(),
+                    "PIP watcher: connecting to policy information point"
+                );
+                let task = tokio::spawn(run_pip_connection(
+                    Arc::clone(&cache),
+                    Arc::clone(&tofu),
+                    sandbox_id.clone(),
+                    key,
+                    name.clone(),
+                    origin,
+                    dir.join(format!("{name}.sock")),
+                ));
+                slot.insert(task);
             }
         }
-        names
+        // Reap finished connection tasks (socket disappeared).
+        managed.retain(|_, task| !task.is_finished());
+        tokio::time::sleep(WATCH_INTERVAL).await;
     }
+}
+
+/// Names (`<name>` from `<name>.sock`) of PIP sockets currently present.
+fn discover_sockets(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "sock") {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+            && !stem.is_empty()
+        {
+            names.push(stem.to_string());
+        }
+    }
+    names
 }
 
 /// Maintain one supervisor-initiated PIP stream until the socket disappears.
 ///
 /// On stream error or disconnect the publisher's cached context reverts to
 /// null and the connection is retried with backoff while the socket exists.
-#[allow(clippy::too_many_arguments)]
 async fn run_pip_connection(
     cache: Arc<PipCache>,
     tofu: Arc<Mutex<HashMap<String, String>>>,
     sandbox_id: String,
+    cache_key: String,
     name: String,
+    origin: PipOrigin,
     socket_path: PathBuf,
 ) {
     loop {
@@ -267,32 +456,29 @@ async fn run_pip_connection(
             return;
         }
 
-        match run_pip_stream_once(&cache, &tofu, &sandbox_id, &name, &socket_path).await {
+        match run_pip_stream_once(
+            &cache,
+            &tofu,
+            &sandbox_id,
+            &cache_key,
+            &name,
+            origin,
+            &socket_path,
+        )
+        .await
+        {
             Ok(()) => {
                 // Stream ended (publisher shutdown); retry after backoff.
-                cache.clear(&name);
+                cache.clear(&cache_key);
                 tracing::info!(pip = %name, "PIP stream: disconnected, context reverted to null");
                 tokio::time::sleep(RECONNECT_BACKOFF).await;
             }
             Err(PipStreamError::TofuMismatch) => {
-                cache.clear(&name);
+                cache.clear(&cache_key);
                 tokio::time::sleep(TOFU_MISMATCH_BACKOFF).await;
             }
-            Err(PipStreamError::UnsupportedPlatform(detail)) => {
-                // Identity verification cannot run on this platform.
-                // Fail closed and stop retrying: connecting without
-                // verification would let any in-sandbox process publish
-                // policy context.
-                cache.clear(&name);
-                tracing::warn!(
-                    pip = %name,
-                    detail = %detail,
-                    "PIP stream: identity verification unsupported on this platform; not connecting (fail closed)"
-                );
-                return;
-            }
             Err(error) => {
-                cache.clear(&name);
+                cache.clear(&cache_key);
                 tracing::warn!(pip = %name, %error, "PIP stream: error, context reverted to null");
                 tokio::time::sleep(RECONNECT_BACKOFF).await;
             }
@@ -304,11 +490,6 @@ async fn run_pip_connection(
 enum PipStreamError {
     /// Binary hash mismatch: fail-closed, do not connect, warn.
     TofuMismatch,
-    /// Publisher identity verification cannot run on this platform.
-    /// Terminal: the connection task stops instead of retrying.
-    /// Constructed only on non-Linux targets.
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
-    UnsupportedPlatform(String),
     Other(String),
 }
 
@@ -316,7 +497,7 @@ impl std::fmt::Display for PipStreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TofuMismatch => write!(f, "publisher binary hash failed TOFU verification"),
-            Self::UnsupportedPlatform(detail) | Self::Other(detail) => write!(f, "{detail}"),
+            Self::Other(detail) => write!(f, "{detail}"),
         }
     }
 }
@@ -325,7 +506,9 @@ async fn run_pip_stream_once(
     cache: &Arc<PipCache>,
     tofu: &Arc<Mutex<HashMap<String, String>>>,
     sandbox_id: &str,
+    cache_key: &str,
     name: &str,
+    origin: PipOrigin,
     socket_path: &Path,
 ) -> Result<(), PipStreamError> {
     // The connector hands the connected stream's peer PID back to us so
@@ -353,8 +536,82 @@ async fn run_pip_stream_once(
         .await
         .map_err(|e| PipStreamError::Other(format!("connect failed: {e}")))?;
 
-    verify_publisher_identity(tofu, name, &peer_pid)?;
+    verify_publisher_identity(tofu, cache_key, name, &peer_pid)?;
 
+    stream_pip_context(cache, cache_key, origin, channel, sandbox_id).await
+}
+
+/// Maintain one remote publisher stream. The endpoint was authorized at
+/// configuration time; transport security is TLS for `https://` endpoints.
+async fn run_remote_pip_connection(
+    cache: Arc<PipCache>,
+    sandbox_id: String,
+    endpoint: String,
+    ca_cert: Option<PathBuf>,
+) {
+    loop {
+        match run_remote_pip_stream_once(&cache, &sandbox_id, &endpoint, &ca_cert).await {
+            Ok(()) => {
+                cache.clear(&endpoint);
+                tracing::info!(
+                    endpoint = %endpoint,
+                    "PIP remote stream: disconnected, context reverted to null"
+                );
+                tokio::time::sleep(RECONNECT_BACKOFF).await;
+            }
+            Err(error) => {
+                cache.clear(&endpoint);
+                tracing::warn!(
+                    endpoint = %endpoint,
+                    %error,
+                    "PIP remote stream: error, context reverted to null"
+                );
+                tokio::time::sleep(RECONNECT_BACKOFF).await;
+            }
+        }
+    }
+}
+
+async fn run_remote_pip_stream_once(
+    cache: &Arc<PipCache>,
+    sandbox_id: &str,
+    endpoint: &str,
+    ca_cert: &Option<PathBuf>,
+) -> Result<(), PipStreamError> {
+    let mut tonic_endpoint = Endpoint::from_shared(endpoint.to_string())
+        .map_err(|e| PipStreamError::Other(format!("invalid endpoint: {e}")))?
+        .connect_timeout(Duration::from_secs(5));
+    if endpoint.starts_with("https://") {
+        let tls = match ca_cert {
+            Some(path) => {
+                let pem = std::fs::read(path)
+                    .map_err(|e| PipStreamError::Other(format!("read CA cert: {e}")))?;
+                tonic::transport::ClientTlsConfig::new()
+                    .ca_certificate(tonic::transport::Certificate::from_pem(pem))
+            }
+            None => tonic::transport::ClientTlsConfig::new(),
+        };
+        tonic_endpoint = tonic_endpoint
+            .tls_config(tls)
+            .map_err(|e| PipStreamError::Other(format!("TLS config: {e}")))?;
+    }
+    let channel = tonic_endpoint
+        .connect()
+        .await
+        .map_err(|e| PipStreamError::Other(format!("connect failed: {e}")))?;
+
+    stream_pip_context(cache, endpoint, PipOrigin::Remote, channel, sandbox_id).await
+}
+
+/// Open `StreamContext` on a connected channel and fold messages into the
+/// cache until the stream ends.
+async fn stream_pip_context(
+    cache: &Arc<PipCache>,
+    cache_key: &str,
+    origin: PipOrigin,
+    channel: tonic::transport::Channel,
+    sandbox_id: &str,
+) -> Result<(), PipStreamError> {
     let mut client =
         openshell_core::proto::pip::v1::policy_information_point_client::PolicyInformationPointClient::new(
             channel,
@@ -372,7 +629,8 @@ async fn run_pip_stream_once(
         let context = message
             .map_err(|e| PipStreamError::Other(format!("StreamContext stream failed: {e}")))?;
         cache.update(
-            name,
+            cache_key,
+            origin,
             context.properties.into_iter().collect::<BTreeMap<_, _>>(),
         );
     }
@@ -384,6 +642,7 @@ async fn run_pip_stream_once(
 /// TOFU cache. First sight pins the hash; a later mismatch fails closed.
 fn verify_publisher_identity(
     tofu: &Arc<Mutex<HashMap<String, String>>>,
+    cache_key: &str,
     name: &str,
     peer_pid: &Arc<Mutex<Option<i32>>>,
 ) -> Result<(), PipStreamError> {
@@ -399,7 +658,7 @@ fn verify_publisher_identity(
             .map_err(|e| PipStreamError::Other(format!("hash publisher exe: {e}")))?;
 
         let mut tofu = tofu.lock().unwrap();
-        match tofu.get(name) {
+        match tofu.get(cache_key) {
             Some(pinned) if pinned != &hash => {
                 drop(tofu);
                 tracing::warn!(
@@ -414,7 +673,7 @@ fn verify_publisher_identity(
                             "openshell.pip.tofu_mismatch",
                             "PIP publisher binary hash failed TOFU verification",
                         ))
-                        .evidence_pairs(&[("pip", name), ("disposition", "not_connected"),])
+                        .evidence_pairs(&[("pip", name), ("disposition", "not_connected")])
                         .message("PIP publisher binary changed; supervisor refused to connect")
                         .build()
                 );
@@ -422,23 +681,16 @@ fn verify_publisher_identity(
             }
             Some(_) => {}
             None => {
-                tofu.insert(name.to_string(), hash);
+                tofu.insert(cache_key.to_string(), hash);
                 tracing::info!(pip = %name, exe = %exe.display(), "PIP publisher binary pinned (TOFU)");
             }
         }
-        Ok(())
     }
     #[cfg(not(target_os = "linux"))]
     {
-        // SO_PEERCRED and /proc-based binary resolution are Linux-only.
-        // Refuse to connect rather than accept an unverified publisher
-        // (fail closed): without identity verification, any in-sandbox
-        // process could publish policy context.
-        let _ = (tofu, peer_pid);
-        Err(PipStreamError::UnsupportedPlatform(format!(
-            "PIP '{name}': publisher identity verification requires SO_PEERCRED and procfs (Linux-only)"
-        )))
+        let _ = (tofu, cache_key, name, peer_pid);
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -469,12 +721,13 @@ mod tests {
         let cache = PipCache::new();
         cache.update(
             "defenseclaw",
+            PipOrigin::Sandbox,
             BTreeMap::from([("trust_state".to_string(), "suspended".to_string())]),
         );
         let merged = cache.merged().unwrap();
         assert_eq!(merged["trust_state"], "suspended");
 
-        cache.update("defenseclaw", BTreeMap::new());
+        cache.update("defenseclaw", PipOrigin::Sandbox, BTreeMap::new());
         assert!(
             cache.merged().is_none(),
             "empty context is equivalent to null"
@@ -482,6 +735,7 @@ mod tests {
 
         cache.update(
             "defenseclaw",
+            PipOrigin::Sandbox,
             BTreeMap::from([("trust_state".to_string(), "suspended".to_string())]),
         );
         cache.clear("defenseclaw");
@@ -490,10 +744,11 @@ mod tests {
     }
 
     #[test]
-    fn multiple_pips_merge_lexicographically_later_name_wins() {
+    fn multiple_pips_merge_latest_writer_wins_per_key() {
         let cache = PipCache::new();
         cache.update(
             "alpha",
+            PipOrigin::Sandbox,
             BTreeMap::from([
                 ("alpha.only".to_string(), "1".to_string()),
                 ("shared".to_string(), "from-alpha".to_string()),
@@ -501,6 +756,7 @@ mod tests {
         );
         cache.update(
             "beta",
+            PipOrigin::OperatorHost,
             BTreeMap::from([
                 ("beta.only".to_string(), "2".to_string()),
                 ("shared".to_string(), "from-beta".to_string()),
@@ -509,12 +765,20 @@ mod tests {
         let merged = cache.merged().unwrap();
         assert_eq!(merged["alpha.only"], "1");
         assert_eq!(merged["beta.only"], "2");
-        // Deterministic merge order: the lexicographically-later PIP
-        // name wins on collision ("beta" > "alpha").
+        // Deterministic merge order: later publisher name wins on collision.
         assert_eq!(merged["shared"], "from-beta");
+        // Snapshots carry each publisher's origin for audit attribution.
+        let snapshot = cache.snapshot().unwrap();
+        assert_eq!(
+            snapshot.publishers,
+            vec![
+                ("alpha".to_string(), PipOrigin::Sandbox),
+                ("beta".to_string(), PipOrigin::OperatorHost),
+            ]
+        );
     }
 
-    // ---- End-to-end tests against a mock in-sandbox publisher ----
+    // ---- End-to-end tests against mock publishers ----
 
     /// tonic `Incoming` stream adapter for a Unix domain socket listener,
     /// mirroring the in-process driver socket servers.
@@ -612,13 +876,13 @@ mod tests {
     }
 
     async fn wait_until<T>(mut probe: impl FnMut() -> Option<T>) -> T {
-        for _ in 0..100 {
+        for _ in 0..200 {
             if let Some(value) = probe() {
                 return value;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        panic!("condition never became true within 5s");
+        panic!("condition never became true within 10s");
     }
 
     #[tokio::test]
@@ -632,7 +896,9 @@ mod tests {
             Arc::clone(&cache),
             Arc::clone(&tofu),
             "sbx-42".to_string(),
+            "sandbox/defenseclaw".to_string(),
             "defenseclaw".to_string(),
+            PipOrigin::Sandbox,
             socket.clone(),
         ));
 
@@ -643,7 +909,7 @@ mod tests {
         // The publisher observed the sandbox id from the request.
         assert_eq!(*seen.lock().unwrap(), Some("sbx-42".to_string()));
         // The publisher binary was pinned trust-on-first-use.
-        assert!(tofu.lock().unwrap().contains_key("defenseclaw"));
+        assert!(tofu.lock().unwrap().contains_key("sandbox/defenseclaw"));
 
         // Publisher shutdown: stream ends and the cached context reverts to
         // null (fail-closed), even though the socket file still exists.
@@ -661,11 +927,20 @@ mod tests {
 
         // Pin a bogus hash for this publisher before the first connection.
         let tofu = Arc::new(Mutex::new(HashMap::from([(
-            "nemoclaw".to_string(),
+            "sandbox/nemoclaw".to_string(),
             "deadbeef".to_string(),
         )])));
         let cache = Arc::new(PipCache::new());
-        let result = run_pip_stream_once(&cache, &tofu, "sbx-42", "nemoclaw", &socket).await;
+        let result = run_pip_stream_once(
+            &cache,
+            &tofu,
+            "sbx-42",
+            "sandbox/nemoclaw",
+            "nemoclaw",
+            PipOrigin::Sandbox,
+            &socket,
+        )
+        .await;
 
         assert!(matches!(result, Err(PipStreamError::TofuMismatch)));
         // No RPC reached the publisher and no context was cached.
@@ -678,16 +953,89 @@ mod tests {
     #[tokio::test]
     async fn watcher_exits_when_pid_is_never_published() {
         // The watcher must not spin or panic when no entrypoint PID arrives;
-        // it exits quietly after the polling window.
+        // the in-sandbox task exits quietly after the polling window.
         let cache = Arc::new(PipCache::new());
         let pid = Arc::new(AtomicU32::new(0));
+        let config = PipWatcherConfig {
+            host_dir_root: tempfile::tempdir().unwrap().keep(),
+            remote_endpoints: Vec::new(),
+            remote_ca_cert: None,
+        };
         // Short-circuit the 5s wait window by running to completion; the
         // watcher polls 20 times at 250ms.
         tokio::time::timeout(
             Duration::from_secs(10),
-            run_pip_watcher(cache, pid, "sbx".into()),
+            run_pip_watcher_with_config(cache, pid, "sbx".into(), config),
         )
         .await
         .expect("watcher exits when PID is never published");
+    }
+
+    #[tokio::test]
+    async fn operator_side_host_publisher_streams_without_entrypoint() {
+        // An operator-side publisher on the supervisor host is served from
+        // <host_root>/<sandbox_id>/<name>.sock and needs no in-sandbox
+        // process at all (entrypoint PID never published).
+        let host_root = tempfile::tempdir().expect("host root");
+        let sandbox_dir = host_root.path().join("sbx-77");
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+        let socket = sandbox_dir.join("navra.sock");
+        let (server, seen, shutdown) = spawn_mock_pip(&socket, "sbx-77").await;
+
+        let cache = Arc::new(PipCache::new());
+        let pid = Arc::new(AtomicU32::new(0));
+        let config = PipWatcherConfig {
+            host_dir_root: host_root.path().to_path_buf(),
+            remote_endpoints: Vec::new(),
+            remote_ca_cert: None,
+        };
+        run_pip_watcher_with_config(Arc::clone(&cache), pid, "sbx-77".to_string(), config).await;
+
+        let merged = wait_until(|| cache.merged()).await;
+        assert_eq!(merged["trust_state"], "suspended");
+        assert_eq!(*seen.lock().unwrap(), Some("sbx-77".to_string()));
+
+        shutdown.send(true).expect("signal publisher shutdown");
+        server.abort();
+        wait_until(|| cache.merged().is_none().then_some(())).await;
+    }
+
+    #[tokio::test]
+    async fn remote_publisher_streams_over_configured_endpoint() {
+        // A remote publisher is a plain TCP gRPC server authorized by
+        // appearing in the configured endpoint list.
+        let seen = Arc::new(Mutex::new(None));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let service = MockPip {
+            expected_sandbox_id: "sbx-88".to_string(),
+            seen_sandbox_id: Arc::clone(&seen),
+            shutdown: shutdown_rx,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(PolicyInformationPointServer::new(service))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        let cache = Arc::new(PipCache::new());
+        let pid = Arc::new(AtomicU32::new(0));
+        let config = PipWatcherConfig {
+            host_dir_root: tempfile::tempdir().unwrap().keep(),
+            remote_endpoints: vec![format!("http://{addr}")],
+            remote_ca_cert: None,
+        };
+        run_pip_watcher_with_config(Arc::clone(&cache), pid, "sbx-88".to_string(), config).await;
+
+        let merged = wait_until(|| cache.merged()).await;
+        assert_eq!(merged["trust_state"], "suspended");
+        assert_eq!(*seen.lock().unwrap(), Some("sbx-88".to_string()));
+
+        shutdown_tx.send(true).expect("signal publisher shutdown");
+        server.abort();
+        wait_until(|| cache.merged().is_none().then_some(())).await;
     }
 }

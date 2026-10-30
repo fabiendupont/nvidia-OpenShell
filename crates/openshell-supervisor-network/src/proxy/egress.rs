@@ -168,6 +168,11 @@ pub(super) struct EgressDecision {
     pub(super) ancestors: Vec<PathBuf>,
     /// Cmdline-derived absolute paths (for script detection).
     pub(super) cmdline_paths: Vec<PathBuf>,
+    /// Published PIP context captured with the denial, for OCSF origin
+    /// tagging (RFC 0019). `None` on allows.
+    pub(super) pip: Option<crate::pip::PipSnapshot>,
+    /// Whether the PIP deny rule influenced this denial.
+    pub(super) pip_influenced: bool,
 }
 
 pub(super) fn connect_span(intent: &EgressIntent) -> tracing::Span {
@@ -254,6 +259,8 @@ mod tests {
             binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
+            pip: None,
+            pip_influenced: false,
         }
     }
 
