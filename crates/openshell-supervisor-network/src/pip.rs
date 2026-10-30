@@ -477,6 +477,14 @@ async fn run_pip_connection(
                 cache.clear(&cache_key);
                 tokio::time::sleep(TOFU_MISMATCH_BACKOFF).await;
             }
+            Err(PipStreamError::UnsupportedPlatform(detail)) => {
+                // Identity verification cannot run on this platform. Fail
+                // closed and stop retrying: connecting without verification
+                // would let any in-sandbox process publish policy context.
+                cache.clear(&cache_key);
+                tracing::warn!(pip = %name, detail = %detail, "PIP stream: identity verification unavailable, not connecting");
+                return;
+            }
             Err(error) => {
                 cache.clear(&cache_key);
                 tracing::warn!(pip = %name, %error, "PIP stream: error, context reverted to null");
@@ -490,6 +498,11 @@ async fn run_pip_connection(
 enum PipStreamError {
     /// Binary hash mismatch: fail-closed, do not connect, warn.
     TofuMismatch,
+    /// Identity verification cannot run on this platform. Terminal: the
+    /// connection task stops instead of retrying. Constructed only on
+    /// non-Linux targets.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    UnsupportedPlatform(String),
     Other(String),
 }
 
@@ -497,7 +510,7 @@ impl std::fmt::Display for PipStreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TofuMismatch => write!(f, "publisher binary hash failed TOFU verification"),
-            Self::Other(detail) => write!(f, "{detail}"),
+            Self::UnsupportedPlatform(detail) | Self::Other(detail) => write!(f, "{detail}"),
         }
     }
 }
@@ -689,8 +702,14 @@ fn verify_publisher_identity(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (tofu, cache_key, name, peer_pid);
+        Err(PipStreamError::UnsupportedPlatform(
+            "publisher identity verification requires /proc (Linux)".into(),
+        ))
     }
-    Ok(())
+    #[cfg(target_os = "linux")]
+    {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -744,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_pips_merge_latest_writer_wins_per_key() {
+    fn multiple_pips_merge_lexicographically_later_name_wins() {
         let cache = PipCache::new();
         cache.update(
             "alpha",
