@@ -3186,7 +3186,38 @@ async fn load_policy_with_gateway(
             // publishers (RFC 0019). Registration in the gateway configuration
             // is the authorization; the PIP watcher connects to these
             // endpoints and the policy poll loop reconciles later changes.
-            engine.replace_pip_services(snapshot.supervisor_pip_services.clone());
+            // When the gateway mints extension credentials, refresh them here
+            // (sharing the supervisor's store so the poll loop later rotates
+            // the same slots in place); a registration without its credential
+            // fails closed instead of downgrading to an unauthenticated call.
+            let pip_services = snapshot.supervisor_pip_services.clone();
+            let pip_authenticated = snapshot.extension_authentication_enabled;
+            let pip_credentials = if pip_authenticated && !pip_services.is_empty() {
+                match openshell_core::grpc_client::CachedOpenShellClient::connect_with_credentials(
+                    endpoint,
+                    extension_credentials.clone(),
+                )
+                .await
+                {
+                    Ok(client) => match client
+                        .refresh_pip_extension_credentials(&pip_services)
+                        .await
+                    {
+                        Ok(credentials) => credentials,
+                        Err(error) => {
+                            warn!("PIP extension credential refresh failed at startup: {error}");
+                            std::collections::HashMap::new()
+                        }
+                    },
+                    Err(error) => {
+                        warn!("PIP extension credential client connect failed at startup: {error}");
+                        std::collections::HashMap::new()
+                    }
+                }
+            } else {
+                std::collections::HashMap::new()
+            };
+            engine.replace_pip_services(pip_services, pip_credentials, pip_authenticated);
 
             // Connect operator-registered middleware services. A connect/describe
             // failure keeps the built-in registry active so each request's
@@ -4067,6 +4098,17 @@ trait PolicyGatewayClient: Clone + Send + Sync + 'static {
         async move { Ok(std::collections::HashMap::new()) }
     }
 
+    fn pip_extension_credentials_for(
+        &self,
+        _services: &[openshell_core::proto::SupervisorPipService],
+    ) -> impl Future<
+        Output = Result<
+            std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>,
+        >,
+    > + Send {
+        async move { Ok(std::collections::HashMap::new()) }
+    }
+
     fn workspace(&self) -> String;
 }
 
@@ -4106,6 +4148,13 @@ impl PolicyGatewayClient for openshell_core::grpc_client::CachedOpenShellClient 
         services: &[openshell_core::proto::SupervisorMiddlewareService],
     ) -> Result<std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>> {
         self.extension_credentials_for(services).await
+    }
+
+    async fn pip_extension_credentials_for(
+        &self,
+        services: &[openshell_core::proto::SupervisorPipService],
+    ) -> Result<std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>> {
+        self.pip_extension_credentials_for(services).await
     }
 
     fn workspace(&self) -> String {
@@ -4371,12 +4420,14 @@ fn next_poll_delay(
 fn retain_extension_credentials(
     store: &openshell_extension_core::ExtensionCredentialStore,
     installed: &[openshell_core::proto::SupervisorMiddlewareService],
+    pip: &[openshell_core::proto::SupervisorPipService],
     extension_authentication_enabled: bool,
 ) {
     let retained = if extension_authentication_enabled {
         installed
             .iter()
             .map(|service| service.name.as_str())
+            .chain(pip.iter().map(|service| service.name.as_str()))
             .collect()
     } else {
         std::collections::HashSet::default()
@@ -4410,9 +4461,13 @@ async fn reconcile_middleware_registry(
     .and_then(|registry| opa_engine.replace_middleware_registry(registry))
     {
         Ok(()) => {
+            // Retain the engine's current PIP registrations too: a
+            // middleware-only rebuild must not detach publisher slots.
+            let pip_services = opa_engine.pip_remote_services();
             retain_extension_credentials(
                 reconciliation.extension_credentials,
                 reconciliation.desired_services,
+                &pip_services,
                 reconciliation.authentication.enabled,
             );
             reconciliation.current_services.clear();

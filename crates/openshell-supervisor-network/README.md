@@ -102,11 +102,21 @@ never expand the allowlist. Because a custom Rego policy could map
 reject operator-supplied Rego that references `input.pip` (the baked policy
 is exempt); authored `pip_deny_rules` is the supported surface.
 
+Remote publishers authenticate with gateway-minted extension credentials
+when `gateway_jwt` is configured: the supervisor refreshes bearer slots
+through `RefreshSandboxToken` (sharing the middleware credential store so
+rotation happens in place) and attaches them on every call; a registration
+missing its credential fails closed. `allow_insecure_transport` opts a
+registration out.
+
+Per-request L7 evaluation: `TunnelPolicyEngine` carries the PIP cache and
+`l7_request_policy_input` merges it into `input.pip`, so a mid-tunnel
+security-state change denies subsequent requests on an established tunnel
+(`deny_request if { pip_denies_network }`), not just new connections.
+
 Denial attribution: `EgressAuthorization` captures a `PipSnapshot`
 (publishers with origins, merged properties) and a `pip_influenced` flag on
 denials, and the denial OCSF events (transparent TCP, staged transparent,
 CONNECT) tag `pip_influenced`/`pip_publishers`/`pip_origins`/`pip_context`
 when the deny rule fired, so analysts can weight in-sandbox-sourced
-evidence accordingly. Prototype follow-ups: per-request L7 evaluation
-against `input.pip`, and authenticated transport (extension credentials)
-for remote publishers, mirroring middleware extension authentication.
+evidence accordingly.

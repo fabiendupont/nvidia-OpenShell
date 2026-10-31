@@ -24,6 +24,7 @@ use openshell_policy_schema::{
     ProcessPolicy as AuthoredProcessPolicy,
 };
 use openshell_supervisor_middleware::{ChainEntry, ChainRunner, MiddlewareRegistry};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, RwLock,
@@ -215,6 +216,12 @@ pub struct OpaEngine {
     /// the gateway configuration snapshot and reconciled by the policy poll
     /// loop. The PIP watcher subscribes to changes.
     pip_services: RwLock<Vec<openshell_core::proto::SupervisorPipService>>,
+    /// Bearer slots for authenticated remote publishers, keyed by
+    /// registration name and rotated in place by the credential store.
+    pip_credentials: RwLock<HashMap<String, openshell_extension_core::BearerTokenSlot>>,
+    /// Whether the gateway mints extension credentials for this sandbox.
+    /// When false, remote publishers connect without a bearer token.
+    pip_authenticated: std::sync::atomic::AtomicBool,
     /// Bumped whenever `pip_services` is replaced.
     pip_services_tx: watch::Sender<u64>,
 }
@@ -290,6 +297,9 @@ pub struct TunnelPolicyEngine {
     generation_guard: PolicyGenerationGuard,
     middleware_runner: ChainRunner,
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
+    /// Published PIP context, read on every per-request L7 evaluation so a
+    /// mid-tunnel security-state change denies subsequent requests.
+    pip_cache: Arc<crate::pip::PipCache>,
 }
 
 impl TunnelPolicyEngine {
@@ -299,6 +309,12 @@ impl TunnelPolicyEngine {
 
     pub fn current_generation(&self) -> u64 {
         self.generation_guard.current_generation()
+    }
+
+    /// The merged PIP properties for per-request L7 evaluation, or `None`
+    /// when no publisher is connected.
+    pub fn pip_snapshot(&self) -> Option<serde_json::Map<String, serde_json::Value>> {
+        self.pip_cache.merged()
     }
 
     pub fn is_stale(&self) -> bool {
@@ -353,6 +369,8 @@ impl OpaEngine {
             fail_closed_reason: RwLock::new(None),
             pip_cache: Arc::new(crate::pip::PipCache::new()),
             pip_services: RwLock::new(Vec::new()),
+            pip_credentials: RwLock::new(HashMap::new()),
+            pip_authenticated: std::sync::atomic::AtomicBool::new(false),
             pip_services_tx: watch::channel(0).0,
         }
     }
@@ -370,12 +388,37 @@ impl OpaEngine {
     /// Called from the gateway snapshot at startup and by the policy poll
     /// loop on reconciliation changes. Registration is the
     /// configuration-time authorization for these endpoints.
-    pub fn replace_pip_services(&self, services: Vec<openshell_core::proto::SupervisorPipService>) {
+    pub fn replace_pip_services(
+        &self,
+        services: Vec<openshell_core::proto::SupervisorPipService>,
+        credentials: HashMap<String, openshell_extension_core::BearerTokenSlot>,
+        authenticated: bool,
+    ) {
+        if let Ok(mut guard) = self.pip_credentials.write() {
+            *guard = credentials;
+        }
+        self.pip_authenticated
+            .store(authenticated, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut guard) = self.pip_services.write() {
             *guard = services;
         }
         self.pip_services_tx
             .send_modify(|generation| *generation += 1);
+    }
+
+    /// Whether the gateway mints extension credentials for remote PIP
+    /// publishers.
+    pub fn pip_authenticated(&self) -> bool {
+        self.pip_authenticated
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The bearer slot for one remote PIP registration, if authenticated.
+    pub fn pip_credential(&self, name: &str) -> Option<openshell_extension_core::BearerTokenSlot> {
+        self.pip_credentials
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(name).cloned())
     }
 
     /// The currently registered remote PIP publishers.
@@ -1242,6 +1285,7 @@ impl OpaEngine {
             },
             middleware_runner: self.middleware_runner()?,
             websocket_assembly_budget: self.websocket_assembly_budget(),
+            pip_cache: Arc::clone(&self.pip_cache),
         })
     }
 }
@@ -4489,6 +4533,53 @@ network_policies:
             decision.reason.contains("not allowed"),
             "Expected specific deny reason, got: {}",
             decision.reason
+        );
+    }
+
+    #[test]
+    fn l7_requests_are_denied_by_pip_context_mid_tunnel() {
+        // A tunnel admitted before the security state changed must deny its
+        // subsequent requests once a publisher reports a matching value.
+        let data = r#"
+network_policies:
+  api:
+    name: api
+    endpoints:
+      - host: api.example.com
+        ports: [443]
+        protocol: rest
+        rules:
+          - allow:
+              method: GET
+              path: /data/**
+    binaries:
+      - path: /usr/bin/curl
+    pip_deny_rules:
+      - key: trust_state
+        equals: suspended
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data)
+            .expect("policy with pip_deny_rules must load");
+        let mut input = l7_input("api.example.com", 443, "GET", "/data/item");
+
+        // No publisher connected: the request is admitted as before.
+        assert!(eval_l7(&engine, &input), "baseline L7 allow expected");
+
+        // Published context denies the request with a PIP-attributable
+        // reason, even though the endpoint and L7 rules still match.
+        input["pip"] = serde_json::json!({"trust_state": "suspended"});
+        assert_l7_denial(
+            &engine,
+            &input,
+            true,
+            "request blocked by policy information point context",
+        );
+
+        // A non-matching published value leaves the request admitted.
+        input["pip"] = serde_json::json!({"trust_state": "healthy"});
+        assert!(
+            eval_l7(&engine, &input),
+            "non-matching PIP value must not deny"
         );
     }
 

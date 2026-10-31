@@ -301,6 +301,13 @@ allowed_token_grant_owners := sort({owner |
 
 default deny_request = false
 
+# PIP context applies within established tunnels too: a mid-tunnel
+# security-state change denies subsequent requests on that tunnel, not just
+# new connections. Same deny-only semantics as the connection decision.
+deny_request if {
+	pip_denies_network
+}
+
 # Per-policy helper: true when this policy has at least one endpoint matching
 # the L4 request whose deny_rules also match the specific L7 request.
 _policy_denies_l7(policy) if {
@@ -531,7 +538,14 @@ request_deny_reason := reason if {
 	not graphql_request_has_operations(input.request)
 	not jsonrpc_response_frame_present(input.request)
 	not mcp_policy_request
+	not pip_denies_network
 	reason := sprintf("%s %s blocked by deny rule", [input.request.method, input.request.path])
+}
+
+request_deny_reason := "request blocked by policy information point context" if {
+	input.request
+	deny_request
+	pip_denies_network
 }
 
 request_deny_reason := reason if {

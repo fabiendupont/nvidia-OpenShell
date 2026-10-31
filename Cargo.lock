@@ -5331,6 +5331,7 @@ dependencies = [
  "openshell-core",
  "openshell-crypto",
  "openshell-driver-vm",
+ "openshell-extension-core",
  "openshell-isolation-interface",
  "openshell-ocsf",
  "openshell-ocsf-validate",

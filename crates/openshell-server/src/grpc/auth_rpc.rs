@@ -357,10 +357,23 @@ pub async fn handle_refresh_sandbox_token(
         config_request
             .extensions_mut()
             .insert(Principal::Sandbox(sandbox.clone()));
-        let available = super::policy::handle_get_sandbox_config(state, config_request)
+        let config = super::policy::handle_get_sandbox_config(state, config_request)
             .await?
-            .into_inner()
-            .supervisor_middleware_services;
+            .into_inner();
+        // Middleware services are selected by the sandbox policy; remote PIP
+        // publishers are operator registrations. Both are mintable extension
+        // services for this sandbox.
+        let mut available: Vec<MintableExtensionService> = config
+            .supervisor_middleware_services
+            .iter()
+            .map(MintableExtensionService::from_middleware)
+            .collect();
+        available.extend(
+            config
+                .supervisor_pip_services
+                .iter()
+                .map(MintableExtensionService::from_pip),
+        );
         mint_extension_credentials(
             issuer,
             &sandbox,
@@ -421,11 +434,37 @@ fn current_unix_seconds() -> i64 {
 }
 
 #[allow(clippy::result_large_err)]
+/// One extension service the gateway can mint a supervisor credential for,
+/// regardless of which registration surface (middleware or PIP) named it.
+struct MintableExtensionService {
+    name: String,
+    audience: String,
+    allow_insecure_transport: bool,
+}
+
+impl MintableExtensionService {
+    fn from_middleware(service: &openshell_core::proto::SupervisorMiddlewareService) -> Self {
+        Self {
+            name: service.name.clone(),
+            audience: service.audience.clone(),
+            allow_insecure_transport: service.allow_insecure_transport,
+        }
+    }
+
+    fn from_pip(service: &openshell_core::proto::SupervisorPipService) -> Self {
+        Self {
+            name: service.name.clone(),
+            audience: service.audience.clone(),
+            allow_insecure_transport: service.allow_insecure_transport,
+        }
+    }
+}
+
 fn mint_extension_credentials(
     issuer: &crate::auth::sandbox_jwt::ExtensionJwtIssuer,
     sandbox: &SandboxPrincipal,
     requested_names: &[String],
-    available_services: &[openshell_core::proto::SupervisorMiddlewareService],
+    available_services: &[MintableExtensionService],
     refresh_replay: Option<&crate::auth::sandbox_session::GatewayRefreshReplay>,
 ) -> Result<Vec<ExtensionServiceCredential>, Status> {
     if requested_names.len() > MAX_EXTENSION_CREDENTIALS_PER_REFRESH {
@@ -447,11 +486,10 @@ fn mint_extension_credentials(
         }
     }
 
-    let available: HashMap<&str, &openshell_core::proto::SupervisorMiddlewareService> =
-        available_services
-            .iter()
-            .map(|service| (service.name.as_str(), service))
-            .collect();
+    let available: HashMap<&str, &MintableExtensionService> = available_services
+        .iter()
+        .map(|service| (service.name.as_str(), service))
+        .collect();
     let ttl = issuer.token_ttl().min(MAX_EXTENSION_TOKEN_TTL);
 
     requested_names
@@ -967,11 +1005,13 @@ mod tests {
     async fn extension_credentials_are_minted_only_for_selected_registration_names() {
         let state = state_with_issuer().await;
         let issuer = state.extension_jwt_issuer.as_deref().expect("issuer");
-        let available = vec![openshell_core::proto::SupervisorMiddlewareService {
-            name: "content-guard".to_string(),
-            audience: "urn:example:content-guard".to_string(),
-            ..Default::default()
-        }];
+        let available = vec![MintableExtensionService::from_middleware(
+            &openshell_core::proto::SupervisorMiddlewareService {
+                name: "content-guard".to_string(),
+                audience: "urn:example:content-guard".to_string(),
+                ..Default::default()
+            },
+        )];
 
         let credentials = mint_extension_credentials(
             issuer,
@@ -1013,12 +1053,14 @@ mod tests {
     async fn opted_out_registrations_never_receive_a_minted_credential() {
         let state = state_with_issuer().await;
         let issuer = state.extension_jwt_issuer.as_deref().expect("issuer");
-        let available = vec![openshell_core::proto::SupervisorMiddlewareService {
-            name: "legacy-guard".to_string(),
-            audience: "urn:example:legacy-guard".to_string(),
-            allow_insecure_transport: true,
-            ..Default::default()
-        }];
+        let available = vec![MintableExtensionService::from_middleware(
+            &openshell_core::proto::SupervisorMiddlewareService {
+                name: "legacy-guard".to_string(),
+                audience: "urn:example:legacy-guard".to_string(),
+                allow_insecure_transport: true,
+                ..Default::default()
+            },
+        )];
 
         // The registration is policy-selected, so authorization passes; the
         // opt-out is what withholds the credential. A supervisor must not be
@@ -1038,11 +1080,13 @@ mod tests {
     async fn extension_credential_request_rejects_duplicate_names_atomically() {
         let state = state_with_issuer().await;
         let issuer = state.extension_jwt_issuer.as_deref().expect("issuer");
-        let available = vec![openshell_core::proto::SupervisorMiddlewareService {
-            name: "content-guard".to_string(),
-            audience: "urn:example:content-guard".to_string(),
-            ..Default::default()
-        }];
+        let available = vec![MintableExtensionService::from_middleware(
+            &openshell_core::proto::SupervisorMiddlewareService {
+                name: "content-guard".to_string(),
+                audience: "urn:example:content-guard".to_string(),
+                ..Default::default()
+            },
+        )];
         let error = mint_extension_credentials(
             issuer,
             &sandbox_a(),

@@ -876,16 +876,15 @@ async fn refresh_extension_credentials_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
     credentials: &GatewayCredentials,
     store: &ExtensionCredentialStore,
-    services: &[crate::proto::SupervisorMiddlewareService],
+    requested_names: &[String],
 ) -> Result<HashMap<String, BearerTokenSlot>> {
-    let names = authenticated_service_names(services);
-    if names.is_empty() {
+    if requested_names.is_empty() {
         return Ok(HashMap::new());
     }
 
     let response = client
         .refresh_sandbox_token(RefreshSandboxTokenRequest {
-            extension_service_names: names.clone(),
+            extension_service_names: requested_names.to_vec(),
         })
         .await
         .into_diagnostic()
@@ -900,7 +899,7 @@ async fn refresh_extension_credentials_with_client(
 
     // Validate the whole response before mutating any slot, so a malformed or
     // partial reply cannot leave the store half-rotated.
-    let expected = names
+    let expected = requested_names
         .iter()
         .map(String::as_str)
         .collect::<std::collections::HashSet<_>>();
@@ -2274,12 +2273,57 @@ impl CachedOpenShellClient {
         &self,
         services: &[crate::proto::SupervisorMiddlewareService],
     ) -> Result<HashMap<String, BearerTokenSlot>> {
+        let names = authenticated_service_names(services);
+        self.refresh_extension_credentials_for_names(&names).await
+    }
+
+    /// Return the slots for remote PIP publisher registrations, rotating
+    /// only when one is missing or due (see [`Self::extension_credentials_for`]).
+    pub async fn pip_extension_credentials_for(
+        &self,
+        services: &[crate::proto::SupervisorPipService],
+    ) -> Result<HashMap<String, BearerTokenSlot>> {
+        let names = services
+            .iter()
+            .filter(|service| !service.allow_insecure_transport)
+            .map(|service| service.name.clone())
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if !self.extension_credentials.needs_refresh(&names, now_ms())
+            && let Some(slots) = self.extension_credentials.slots_for(&names)
+        {
+            return Ok(slots);
+        }
+        self.refresh_extension_credentials_for_names(&names).await
+    }
+
+    /// Rotate credentials for remote PIP publisher registrations
+    /// unconditionally.
+    pub async fn refresh_pip_extension_credentials(
+        &self,
+        services: &[crate::proto::SupervisorPipService],
+    ) -> Result<HashMap<String, BearerTokenSlot>> {
+        let names = services
+            .iter()
+            .filter(|service| !service.allow_insecure_transport)
+            .map(|service| service.name.clone())
+            .collect::<Vec<_>>();
+        self.refresh_extension_credentials_for_names(&names).await
+    }
+
+    /// Rotate credentials for the named extension services unconditionally.
+    async fn refresh_extension_credentials_for_names(
+        &self,
+        names: &[String],
+    ) -> Result<HashMap<String, BearerTokenSlot>> {
         let mut client = self.client.clone();
         refresh_extension_credentials_with_client(
             &mut client,
             &self.credentials,
             &self.extension_credentials,
-            services,
+            names,
         )
         .await
     }

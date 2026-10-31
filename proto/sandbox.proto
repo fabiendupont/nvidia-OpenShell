@@ -527,6 +527,15 @@ message SupervisorPipService {
   // PEM-encoded trust roots loaded by the gateway from the operator-configured
   // tls_ca_cert_path. Empty uses the platform trust store.
   bytes tls_ca_cert_pem = 3;
+  // Exact JWT audience for supervisor-minted extension credentials. The
+  // gateway resolves an omitted operator value to a kind-scoped audience
+  // derived from the registration name before sending sandbox config.
+  string audience = 4;
+  // Operator opt-out from extension authentication for this registration.
+  // When true the supervisor may use a plaintext endpoint and OpenShell
+  // attaches no bearer credential. Intended only for trusted-network
+  // development deployments.
+  bool allow_insecure_transport = 5;
 }
 
 // Connection details for one operator-registered supervisor middleware service.

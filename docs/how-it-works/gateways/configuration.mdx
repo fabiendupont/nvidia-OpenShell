@@ -963,6 +963,8 @@ tls_ca_cert_path = "/etc/openshell/certs/navra-ca.pem"
 
 Registration is static and operator-owned; changing it requires restarting the gateway. Registration is also the authorization: the supervisor initiates a `StreamContext` stream only to endpoints on the configured list and maps each stream to its sandbox by the sandbox id carried in the request. The `grpc_endpoint` supports plaintext `http://` and TLS `https://`; HTTPS uses the platform trust store unless `tls_ca_cert_path` names a certificate-only PEM bundle. Publishers on the same host as the supervisors can instead serve a Unix domain socket under `/run/openshell-supervisor/pip/<sandbox-id>/` with no gateway registration.
 
+When `gateway_jwt` is configured, the gateway mints short-lived extension credentials for every registration and supervisors attach them as bearer tokens on each call, rotating in place; an authenticated registration without its credential fails closed instead of downgrading to an unauthenticated call. `audience` sets the exact JWT audience and defaults to `urn:openshell:extension:pip:<name>`. Set `allow_insecure_transport = true` to keep a plaintext `http://` endpoint with no credential attached; OpenShell logs a warning naming the registration at every startup. Registration names share the extension-service namespace with middleware registrations, so a PIP and a middleware registration must not use the same name.
+
 Governance frameworks running inside a sandbox can publish the same way from `/run/openshell/pip/<name>.sock` without any configuration; the supervisor verifies the serving binary's identity before connecting.
 
 ## Gateway Interceptors

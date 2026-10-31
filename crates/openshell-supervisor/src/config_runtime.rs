@@ -555,10 +555,25 @@ impl ConfigRuntime {
                     // Operator-registered remote PIP publishers (RFC 0019)
                     // are configuration, not policy: reconcile them on every
                     // admitted snapshot so registration changes take effect
-                    // without a policy hash change.
+                    // without a policy hash change. Credentials rotate only
+                    // when due, mirroring the middleware cadence.
                     if self.pip_services != result.supervisor_pip_services {
-                        ctx.opa_engine
-                            .replace_pip_services(result.supervisor_pip_services.clone());
+                        let pip_credentials = if result.extension_authentication_enabled {
+                            client
+                                .pip_extension_credentials_for(&result.supervisor_pip_services)
+                                .await
+                                .unwrap_or_else(|error| {
+                                    warn!("PIP extension credential refresh failed: {error}");
+                                    std::collections::HashMap::new()
+                                })
+                        } else {
+                            std::collections::HashMap::new()
+                        };
+                        ctx.opa_engine.replace_pip_services(
+                            result.supervisor_pip_services.clone(),
+                            pip_credentials,
+                            result.extension_authentication_enabled,
+                        );
                         self.pip_services
                             .clone_from(&result.supervisor_pip_services);
                     }
@@ -566,6 +581,7 @@ impl ConfigRuntime {
                     retain_extension_credentials(
                         &ctx.extension_credentials,
                         &result.supervisor_middleware_services,
+                        &result.supervisor_pip_services,
                         result.extension_authentication_enabled,
                     );
                     self.middleware_registry_status = MiddlewareRegistryStatus::Synchronized;

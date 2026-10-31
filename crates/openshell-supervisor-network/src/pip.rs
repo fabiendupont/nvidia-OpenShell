@@ -202,11 +202,18 @@ pub struct PipWatcherConfig {
     pub remote_ca_cert: Option<PathBuf>,
 }
 
-/// One remote publisher endpoint with its optional PEM trust roots.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One remote publisher endpoint with its optional PEM trust roots and
+/// extension-credential bearer slot.
+#[derive(Clone, Debug)]
 pub struct RemotePipEndpoint {
+    /// Registration name, when the endpoint came from a gateway
+    /// registration; `None` for environment-configured endpoints.
+    pub name: Option<String>,
     pub endpoint: String,
     pub ca_pem: Option<Vec<u8>>,
+    /// Bearer slot for extension authentication. `None` connects without a
+    /// credential (authentication disabled or opted out).
+    pub bearer: Option<openshell_extension_core::BearerTokenSlot>,
 }
 
 impl Default for PipWatcherConfig {
@@ -361,8 +368,10 @@ async fn run_pip_watcher_with_config_and_engine(
         .remote_endpoints
         .iter()
         .map(|endpoint| RemotePipEndpoint {
+            name: None,
             endpoint: endpoint.clone(),
             ca_pem: env_ca_pem.clone(),
+            bearer: None,
         })
         .collect();
     if let Some(engine) = engine {
@@ -371,10 +380,31 @@ async fn run_pip_watcher_with_config_and_engine(
         tokio::spawn(async move {
             let mut generation = watcher_engine.subscribe_pip_services();
             loop {
+                let authenticated = watcher_engine.pip_authenticated();
                 let registered: Vec<RemotePipEndpoint> = watcher_engine
                     .pip_remote_services()
                     .into_iter()
+                    .filter(|service| {
+                        if authenticated
+                            && !service.allow_insecure_transport
+                            && watcher_engine.pip_credential(&service.name).is_none()
+                        {
+                            // Fail closed rather than silently downgrading to
+                            // an unauthenticated call (mirrors middleware).
+                            tracing::warn!(
+                                pip = %service.name,
+                                "PIP registration is missing its extension credential; not connecting"
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    })
                     .map(|service| RemotePipEndpoint {
+                        bearer: authenticated
+                            .then(|| watcher_engine.pip_credential(&service.name))
+                            .flatten(),
+                        name: Some(service.name),
                         endpoint: service.grpc_endpoint,
                         ca_pem: (!service.tls_ca_cert_pem.is_empty())
                             .then_some(service.tls_ca_cert_pem),
@@ -382,10 +412,15 @@ async fn run_pip_watcher_with_config_and_engine(
                     .collect();
                 let mut merged = env_endpoints.clone();
                 for endpoint in registered {
-                    if !merged
-                        .iter()
-                        .any(|existing| existing.endpoint == endpoint.endpoint)
+                    if let Some(existing) = merged
+                        .iter_mut()
+                        .find(|existing| existing.endpoint == endpoint.endpoint)
                     {
+                        // A gateway registration supersedes an environment
+                        // endpoint for the same address, including its
+                        // credential.
+                        *existing = endpoint;
+                    } else {
                         merged.push(endpoint);
                     }
                 }
@@ -448,8 +483,7 @@ impl RemotePipManager {
                 let task = tokio::spawn(run_remote_pip_connection(
                     Arc::clone(&self.cache),
                     self.sandbox_id.clone(),
-                    endpoint.endpoint.clone(),
-                    endpoint.ca_pem.clone(),
+                    endpoint,
                 ));
                 slot.insert(task);
             }
@@ -691,11 +725,11 @@ async fn run_pip_stream_once(
 async fn run_remote_pip_connection(
     cache: Arc<PipCache>,
     sandbox_id: String,
-    endpoint: String,
-    ca_pem: Option<Vec<u8>>,
+    remote: RemotePipEndpoint,
 ) {
+    let endpoint = remote.endpoint.clone();
     loop {
-        match run_remote_pip_stream_once(&cache, &sandbox_id, &endpoint, &ca_pem).await {
+        match run_remote_pip_stream_once(&cache, &sandbox_id, &remote).await {
             Ok(()) => {
                 cache.clear(&endpoint);
                 tracing::info!(
@@ -720,19 +754,20 @@ async fn run_remote_pip_connection(
 async fn run_remote_pip_stream_once(
     cache: &Arc<PipCache>,
     sandbox_id: &str,
-    endpoint: &str,
-    ca_pem: &Option<Vec<u8>>,
+    remote: &RemotePipEndpoint,
 ) -> Result<(), PipStreamError> {
-    let mut tonic_endpoint = Endpoint::from_shared(endpoint.to_string())
+    let mut tonic_endpoint = Endpoint::from_shared(remote.endpoint.clone())
         .map_err(|e| PipStreamError::Other(format!("invalid endpoint: {e}")))?
         .connect_timeout(Duration::from_secs(5));
-    if endpoint.starts_with("https://") {
-        let tls = ca_pem
-            .clone()
-            .map_or_else(tonic::transport::ClientTlsConfig::new, |pem| {
-                tonic::transport::ClientTlsConfig::new()
-                    .ca_certificate(tonic::transport::Certificate::from_pem(pem))
-            });
+    if remote.endpoint.starts_with("https://") {
+        let tls =
+            remote
+                .ca_pem
+                .clone()
+                .map_or_else(tonic::transport::ClientTlsConfig::new, |pem| {
+                    tonic::transport::ClientTlsConfig::new()
+                        .ca_certificate(tonic::transport::Certificate::from_pem(pem))
+                });
         tonic_endpoint = tonic_endpoint
             .tls_config(tls)
             .map_err(|e| PipStreamError::Other(format!("TLS config: {e}")))?;
@@ -741,19 +776,39 @@ async fn run_remote_pip_stream_once(
         .connect()
         .await
         .map_err(|e| PipStreamError::Other(format!("connect failed: {e}")))?;
+    // Extension authentication attaches the bearer on every call, reading the
+    // current token from the shared slot so rotation needs no reconnect.
+    let interceptor = remote.bearer.clone().map_or_else(
+        openshell_extension_core::BearerTokenInterceptor::disabled,
+        |slot| slot.interceptor(),
+    );
+    let channel = tonic::service::interceptor::InterceptedService::new(channel, interceptor);
 
-    stream_pip_context(cache, endpoint, PipOrigin::Remote, channel, sandbox_id).await
+    stream_pip_context(
+        cache,
+        &remote.endpoint,
+        PipOrigin::Remote,
+        channel,
+        sandbox_id,
+    )
+    .await
 }
 
 /// Open `StreamContext` on a connected channel and fold messages into the
 /// cache until the stream ends.
-async fn stream_pip_context(
+async fn stream_pip_context<C>(
     cache: &Arc<PipCache>,
     cache_key: &str,
     origin: PipOrigin,
-    channel: tonic::transport::Channel,
+    channel: C,
     sandbox_id: &str,
-) -> Result<(), PipStreamError> {
+) -> Result<(), PipStreamError>
+where
+    C: tonic::client::GrpcService<tonic::body::Body> + Clone,
+    C::Error: Into<tonic::codegen::StdError>,
+    C::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    <C::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+{
     let mut client =
         openshell_core::proto::pip::v1::policy_information_point_client::PolicyInformationPointClient::new(
             channel,
@@ -949,6 +1004,10 @@ mod tests {
     struct MockPip {
         expected_sandbox_id: String,
         seen_sandbox_id: Arc<Mutex<Option<String>>>,
+        /// Whether the publisher requires extension-authentication bearers.
+        require_bearer: bool,
+        /// Whether a valid bearer was observed on the accepted stream.
+        seen_bearer: Arc<Mutex<bool>>,
         /// Signals the per-stream task to end the stream (publisher exit).
         shutdown: tokio::sync::watch::Receiver<bool>,
     }
@@ -962,6 +1021,15 @@ mod tests {
             &self,
             request: tonic::Request<StreamContextRequest>,
         ) -> Result<tonic::Response<Self::StreamContextStream>, tonic::Status> {
+            let bearer_ok = request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("Bearer "));
+            if self.require_bearer && !bearer_ok {
+                return Err(tonic::Status::unauthenticated("missing bearer"));
+            }
+            *self.seen_bearer.lock().unwrap() = bearer_ok;
             let sandbox_id = request.into_inner().sandbox_id;
             if sandbox_id != self.expected_sandbox_id {
                 return Err(tonic::Status::permission_denied("sandbox mismatch"));
@@ -1012,6 +1080,8 @@ mod tests {
         let service = MockPip {
             expected_sandbox_id: sandbox_id.to_string(),
             seen_sandbox_id: Arc::clone(&seen),
+            require_bearer: false,
+            seen_bearer: Arc::new(Mutex::new(false)),
             shutdown: shutdown_rx,
         };
         let serve = tonic::transport::Server::builder()
@@ -1157,10 +1227,13 @@ mod tests {
         const POLICY_REGO: &str = include_str!("../data/sandbox-policy.rego");
 
         let seen = Arc::new(Mutex::new(None));
+        let seen_bearer = Arc::new(Mutex::new(false));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let service = MockPip {
             expected_sandbox_id: "sbx-99".to_string(),
             seen_sandbox_id: Arc::clone(&seen),
+            require_bearer: true,
+            seen_bearer: Arc::clone(&seen_bearer),
             shutdown: shutdown_rx,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1191,17 +1264,59 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(cache.merged().is_none());
 
-        engine.replace_pip_services(vec![openshell_core::proto::SupervisorPipService {
-            name: "navra".to_string(),
-            grpc_endpoint: format!("http://{addr}"),
-            tls_ca_cert_pem: Vec::new(),
-        }]);
+        // An authenticated registration without its credential fails closed:
+        // the watcher refuses to connect rather than downgrade to an
+        // unauthenticated call.
+        engine.replace_pip_services(
+            vec![openshell_core::proto::SupervisorPipService {
+                name: "navra".to_string(),
+                grpc_endpoint: format!("http://{addr}"),
+                tls_ca_cert_pem: Vec::new(),
+                audience: String::new(),
+                allow_insecure_transport: false,
+            }],
+            HashMap::new(),
+            true,
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            cache.merged().is_none(),
+            "missing credential must fail closed"
+        );
+
+        // With the credential installed, the stream connects and carries the
+        // extension bearer on every call.
+        let expires_at_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap()
+            + 3_600_000;
+        let slot = openshell_extension_core::BearerTokenSlot::new("test-pip-token", expires_at_ms)
+            .expect("bearer slot");
+        engine.replace_pip_services(
+            vec![openshell_core::proto::SupervisorPipService {
+                name: "navra".to_string(),
+                grpc_endpoint: format!("http://{addr}"),
+                tls_ca_cert_pem: Vec::new(),
+                audience: String::new(),
+                allow_insecure_transport: false,
+            }],
+            HashMap::from([("navra".to_string(), slot)]),
+            true,
+        );
         let merged = wait_until(|| cache.merged()).await;
         assert_eq!(merged["trust_state"], "suspended");
         assert_eq!(*seen.lock().unwrap(), Some("sbx-99".to_string()));
+        assert!(
+            *seen_bearer.lock().unwrap(),
+            "bearer must reach the publisher"
+        );
 
         // Removing the registration stops the stream and reverts the cache.
-        engine.replace_pip_services(Vec::new());
+        engine.replace_pip_services(Vec::new(), HashMap::new(), true);
         wait_until(|| cache.merged().is_none().then_some(())).await;
 
         shutdown_tx.send(true).expect("signal publisher shutdown");
@@ -1217,6 +1332,8 @@ mod tests {
         let service = MockPip {
             expected_sandbox_id: "sbx-88".to_string(),
             seen_sandbox_id: Arc::clone(&seen),
+            require_bearer: false,
+            seen_bearer: Arc::new(Mutex::new(false)),
             shutdown: shutdown_rx,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -1279,6 +1279,15 @@ pub struct PipServiceFileConfig {
     /// Optional PEM trust-root bundle for an HTTPS endpoint.
     #[serde(default)]
     pub tls_ca_cert_path: Option<PathBuf>,
+    /// Exact JWT audience for supervisor extension credentials. Defaults to
+    /// a kind-scoped value derived from the registration name.
+    #[serde(default)]
+    pub audience: Option<String>,
+    /// Opt out of extension authentication for this registration, permitting
+    /// a plaintext `http://` endpoint with no bearer credential. Development
+    /// and trusted-network deployments only.
+    #[serde(default)]
+    pub allow_insecure_transport: bool,
 }
 
 impl TryFrom<&PipServiceFileConfig> for SupervisorPipService {
@@ -1301,6 +1310,15 @@ impl TryFrom<&PipServiceFileConfig> for SupervisorPipService {
             name: config.name.clone(),
             grpc_endpoint: config.grpc_endpoint.clone(),
             tls_ca_cert_pem,
+            audience: config
+                .audience
+                .as_deref()
+                .filter(|audience| !audience.is_empty())
+                .map_or_else(
+                    || format!("urn:openshell:extension:pip:{}", config.name),
+                    ToString::to_string,
+                ),
+            allow_insecure_transport: config.allow_insecure_transport,
         })
     }
 }
@@ -3043,12 +3061,17 @@ tls_ca_cert_path = 'CA_PATH'
                 name: "navra".into(),
                 grpc_endpoint: "https://navra.internal:50051".into(),
                 tls_ca_cert_path: Some(ca.path().to_path_buf()),
+                audience: None,
+                allow_insecure_transport: false,
             }]
         );
         let registration = SupervisorPipService::try_from(&file.openshell.supervisor.pip[0])
             .expect("valid CA resolves");
         assert_eq!(registration.name, "navra");
         assert_eq!(registration.grpc_endpoint, "https://navra.internal:50051");
+        // An omitted audience resolves to the kind-scoped default.
+        assert_eq!(registration.audience, "urn:openshell:extension:pip:navra");
+        assert!(!registration.allow_insecure_transport);
         let registered_pem = String::from_utf8(registration.tls_ca_cert_pem.clone())
             .expect("registered CA remains PEM text")
             .replace("\r\n", "\n");
@@ -3063,13 +3086,30 @@ tls_ca_cert_path = 'CA_PATH'
 [[openshell.supervisor.pip]]
 name = 'navra'
 grpc_endpoint = 'http://127.0.0.1:50051'
-audience = 'bogus'
+max_payload_bytes = 1024
 ",
         );
         assert!(matches!(
             load(tmp.path()),
             Err(ConfigFileError::Parse { .. })
         ));
+    }
+
+    #[test]
+    fn supervisor_pip_registration_accepts_explicit_audience_and_opt_out() {
+        let toml = r#"
+[[openshell.supervisor.pip]]
+name = "navra"
+grpc_endpoint = "http://127.0.0.1:50051"
+audience = "urn:example:navra"
+allow_insecure_transport = true
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("explicit audience and opt-out parse");
+        let registration =
+            SupervisorPipService::try_from(&file.openshell.supervisor.pip[0]).unwrap();
+        assert_eq!(registration.audience, "urn:example:navra");
+        assert!(registration.allow_insecure_transport);
     }
 
     #[test]

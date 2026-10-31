@@ -2669,9 +2669,18 @@ type SupervisorPipService struct {
 	GrpcEndpoint string `protobuf:"bytes,2,opt,name=grpc_endpoint,json=grpcEndpoint,proto3" json:"grpc_endpoint,omitempty"`
 	// PEM-encoded trust roots loaded by the gateway from the operator-configured
 	// tls_ca_cert_path. Empty uses the platform trust store.
-	TlsCaCertPem  []byte `protobuf:"bytes,3,opt,name=tls_ca_cert_pem,json=tlsCaCertPem,proto3" json:"tls_ca_cert_pem,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	TlsCaCertPem []byte `protobuf:"bytes,3,opt,name=tls_ca_cert_pem,json=tlsCaCertPem,proto3" json:"tls_ca_cert_pem,omitempty"`
+	// Exact JWT audience for supervisor-minted extension credentials. The
+	// gateway resolves an omitted operator value to a kind-scoped audience
+	// derived from the registration name before sending sandbox config.
+	Audience string `protobuf:"bytes,4,opt,name=audience,proto3" json:"audience,omitempty"`
+	// Operator opt-out from extension authentication for this registration.
+	// When true the supervisor may use a plaintext endpoint and OpenShell
+	// attaches no bearer credential. Intended only for trusted-network
+	// development deployments.
+	AllowInsecureTransport bool `protobuf:"varint,5,opt,name=allow_insecure_transport,json=allowInsecureTransport,proto3" json:"allow_insecure_transport,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *SupervisorPipService) Reset() {
@@ -2723,6 +2732,20 @@ func (x *SupervisorPipService) GetTlsCaCertPem() []byte {
 		return x.TlsCaCertPem
 	}
 	return nil
+}
+
+func (x *SupervisorPipService) GetAudience() string {
+	if x != nil {
+		return x.Audience
+	}
+	return ""
+}
+
+func (x *SupervisorPipService) GetAllowInsecureTransport() bool {
+	if x != nil {
+		return x.AllowInsecureTransport
+	}
+	return false
 }
 
 // Connection details for one operator-registered supervisor middleware service.
@@ -3073,11 +3096,13 @@ const file_sandbox_proto_rawDesc = "" +
 	"\vtarget_port\x18\x03 \x01(\rR\n" +
 	"targetPort\x12-\n" +
 	"\x12authorization_mode\x18\x04 \x01(\x05R\x11authorizationMode\x12)\n" +
-	"\x10resource_version\x18\x05 \x01(\x04R\x0fresourceVersion\"v\n" +
+	"\x10resource_version\x18\x05 \x01(\x04R\x0fresourceVersion\"\xcc\x01\n" +
 	"\x14SupervisorPipService\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12#\n" +
 	"\rgrpc_endpoint\x18\x02 \x01(\tR\fgrpcEndpoint\x12%\n" +
-	"\x0ftls_ca_cert_pem\x18\x03 \x01(\fR\ftlsCaCertPem\"\x81\x04\n" +
+	"\x0ftls_ca_cert_pem\x18\x03 \x01(\fR\ftlsCaCertPem\x12\x1a\n" +
+	"\baudience\x18\x04 \x01(\tR\baudience\x128\n" +
+	"\x18allow_insecure_transport\x18\x05 \x01(\bR\x16allowInsecureTransport\"\x81\x04\n" +
 	"\x1bSupervisorMiddlewareService\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12#\n" +
 	"\rgrpc_endpoint\x18\x02 \x01(\tR\fgrpcEndpoint\x12*\n" +

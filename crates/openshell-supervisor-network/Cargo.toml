@@ -16,6 +16,7 @@ sha2 = { workspace = true }
 openshell-binary-identity = { path = "../openshell-binary-identity" }
 openshell-crypto = { workspace = true }
 openshell-core = { path = "../openshell-core", features = ["oauth"] }
+openshell-extension-core = { path = "../openshell-extension-core" }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }

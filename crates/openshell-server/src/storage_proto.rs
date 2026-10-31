@@ -179,11 +179,13 @@ mod tests {
     // updates use a separate capability/service and add one classified RPC.
     // Policy Information Point support (RFC 0019) adds the public
     // PipDenyRule message and pip_deny_rules to NetworkPolicyRule, and
-    // SupervisorPipService with the supervisor_pip_services snapshot field.
-    // Both are additive with proto3 defaults; stored policies decode with an
-    // empty PIP deny list and configuration snapshots with no registrations.
+    // SupervisorPipService with the supervisor_pip_services snapshot field
+    // (later extended with audience and allow_insecure_transport for
+    // extension authentication). Both are additive with proto3 defaults;
+    // stored policies decode with an empty PIP deny list and configuration
+    // snapshots with no registrations.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "a8a0561154673c160fea86e807e21d0ff021bc81e48daa0073266921064d57de";
+        "ce84fb11f4395f6cdf39070f6d684cb1115eaefe58534403edcf372d6c7f25ad";
     const DURABLE_SCHEMA_SHA256: &str =
         "b96783c4e19e3e11eb249894d99374150fba60c26e3cad675a8c0c66cbf00ec0";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =

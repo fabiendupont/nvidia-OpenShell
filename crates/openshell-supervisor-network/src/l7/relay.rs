@@ -3456,11 +3456,12 @@ fn admitted_token_grant_owners_once(
     if engine.is_stale() {
         return Err(miette!("policy changed before token grant selection"));
     }
+    let input = l7_request_policy_input(engine, ctx, request);
     let mut engine = engine
         .engine()
         .lock()
         .map_err(|_| miette!("OPA engine lock poisoned"))?;
-    crate::opa::set_regorus_input(&mut engine, l7_request_policy_input(ctx, request))?;
+    crate::opa::set_regorus_input(&mut engine, input)?;
     let owners = engine
         .eval_rule("data.openshell.sandbox.allowed_token_grant_owners".into())
         .map_err(|error| miette!("{error}"))?;
@@ -3476,8 +3477,12 @@ fn admitted_token_grant_owners_once(
         .collect()
 }
 
-fn l7_request_policy_input(ctx: &L7EvalContext, request: &L7RequestInfo) -> serde_json::Value {
-    serde_json::json!({
+fn l7_request_policy_input(
+    engine: &TunnelPolicyEngine,
+    ctx: &L7EvalContext,
+    request: &L7RequestInfo,
+) -> serde_json::Value {
+    let mut input = serde_json::json!({
         "network": { "host": ctx.host, "port": ctx.port },
         "exec": {
             "path": ctx.binary_path,
@@ -3491,7 +3496,14 @@ fn l7_request_policy_input(ctx: &L7EvalContext, request: &L7RequestInfo) -> serd
             "graphql": request.graphql.clone(),
             "jsonrpc": request.jsonrpc.as_ref().map(jsonrpc_policy_input),
         }
-    })
+    });
+    // Published PIP context participates in every per-request evaluation, so
+    // a mid-tunnel security-state change denies subsequent requests (RFC
+    // 0019). Absent context leaves input.pip null.
+    if let Some(pip) = engine.pip_snapshot() {
+        input["pip"] = serde_json::Value::Object(pip);
+    }
+    input
 }
 
 fn evaluate_l7_request_once(
@@ -3507,7 +3519,7 @@ fn evaluate_l7_request_once(
         ));
     }
 
-    let input = l7_request_policy_input(ctx, request);
+    let input = l7_request_policy_input(engine, ctx, request);
 
     let mut engine = engine
         .engine()
