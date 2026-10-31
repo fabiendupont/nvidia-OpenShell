@@ -398,7 +398,7 @@ impl OpaEngine {
             *guard = credentials;
         }
         self.pip_authenticated
-            .store(authenticated, std::sync::atomic::Ordering::Relaxed);
+            .store(authenticated, Ordering::Relaxed);
         if let Ok(mut guard) = self.pip_services.write() {
             *guard = services;
         }
@@ -409,8 +409,7 @@ impl OpaEngine {
     /// Whether the gateway mints extension credentials for remote PIP
     /// publishers.
     pub fn pip_authenticated(&self) -> bool {
-        self.pip_authenticated
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.pip_authenticated.load(Ordering::Relaxed)
     }
 
     /// The bearer slot for one remote PIP registration, if authenticated.
@@ -2382,7 +2381,7 @@ fn resolve_binary_in_container(_policy_path: &str, _entrypoint_pid: u32) -> Bina
 }
 
 fn l7_matchers_to_json(
-    matchers: &std::collections::HashMap<String, openshell_core::proto::L7QueryMatcher>,
+    matchers: &HashMap<String, openshell_core::proto::L7QueryMatcher>,
 ) -> serde_json::Map<String, serde_json::Value> {
     matchers
         .iter()
