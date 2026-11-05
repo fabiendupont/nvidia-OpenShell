@@ -146,8 +146,10 @@ impl PipCache {
     /// Merge every connected publisher's properties into one object.
     ///
     /// Returns `None` when no publisher is connected. Key collisions between
-    /// publishers are resolved by lexicographic publisher name order;
-    /// publishers should prefix their keys by convention to avoid this.
+    /// publishers are resolved by origin trust: in-sandbox values apply
+    /// first, remote operator values next, and same-host operator values
+    /// last, so the more trusted publisher wins. Publishers should still
+    /// prefix their keys by convention to avoid collisions entirely.
     pub fn merged(&self) -> Option<serde_json::Map<String, serde_json::Value>> {
         self.snapshot().map(|snapshot| snapshot.properties)
     }
@@ -158,8 +160,23 @@ impl PipCache {
         if guard.is_empty() {
             return None;
         }
+        // Apply entries in ascending origin precedence so operator-published
+        // values overwrite in-sandbox values on key collisions: the sandbox
+        // is the untrusted party and must not be able to override operator
+        // context (for example, replacing trust_state=suspended with
+        // trusted). Within one origin, publisher names break ties
+        // deterministically.
+        let precedence = |origin: PipOrigin| match origin {
+            PipOrigin::Sandbox => 0,
+            PipOrigin::Remote => 1,
+            PipOrigin::OperatorHost => 2,
+        };
+        let mut entries: Vec<(&String, &PipEntry)> = guard.iter().collect();
+        entries.sort_by(|(left_name, left), (right_name, right)| {
+            (precedence(left.origin), left_name).cmp(&(precedence(right.origin), right_name))
+        });
         let mut merged = serde_json::Map::new();
-        for entry in guard.values() {
+        for (_, entry) in &entries {
             for (key, value) in &entry.properties {
                 merged.insert(key.clone(), serde_json::Value::String(value.clone()));
             }
@@ -851,7 +868,14 @@ fn verify_publisher_identity(
             .ok_or_else(|| PipStreamError::Other("no peer credentials on PIP socket".into()))?;
         let exe = procfs::binary_path(pid)
             .map_err(|e| PipStreamError::Other(format!("resolve publisher exe: {e}")))?;
-        let hash = procfs::file_sha256(&exe)
+        // Hash the live executable through the /proc/<pid>/exe magic symlink,
+        // not the resolved path: the path is inside the sandbox's mount
+        // namespace, so opening it from the supervisor could miss the file or
+        // hash an unrelated host file at the same location. Opening the
+        // symlink reads the publisher's actual running binary (mirrors
+        // `verify_or_cache_process_exe`).
+        let live_exe = PathBuf::from(format!("/proc/{pid}/exe"));
+        let hash = procfs::file_sha256(&live_exe)
             .map_err(|e| PipStreamError::Other(format!("hash publisher exe: {e}")))?;
 
         let mut tofu = tofu.lock().unwrap();
@@ -947,14 +971,15 @@ mod tests {
     }
 
     #[test]
-    fn multiple_pips_merge_lexicographically_later_name_wins() {
+    fn multiple_pips_merge_with_operator_precedence() {
         let cache = PipCache::new();
         cache.update(
-            "alpha",
+            // Lexicographically last, but the least trusted origin.
+            "zeta",
             PipOrigin::Sandbox,
             BTreeMap::from([
-                ("alpha.only".to_string(), "1".to_string()),
-                ("shared".to_string(), "from-alpha".to_string()),
+                ("zeta.only".to_string(), "1".to_string()),
+                ("shared".to_string(), "from-sandbox".to_string()),
             ]),
         );
         cache.update(
@@ -962,22 +987,43 @@ mod tests {
             PipOrigin::OperatorHost,
             BTreeMap::from([
                 ("beta.only".to_string(), "2".to_string()),
-                ("shared".to_string(), "from-beta".to_string()),
+                ("shared".to_string(), "from-operator".to_string()),
             ]),
         );
         let merged = cache.merged().unwrap();
-        assert_eq!(merged["alpha.only"], "1");
+        assert_eq!(merged["zeta.only"], "1");
         assert_eq!(merged["beta.only"], "2");
-        // Deterministic merge order: later publisher name wins on collision.
-        assert_eq!(merged["shared"], "from-beta");
+        // Operator values win key collisions regardless of name order: the
+        // in-sandbox publisher cannot override operator context.
+        assert_eq!(merged["shared"], "from-operator");
         // Snapshots carry each publisher's origin for audit attribution.
         let snapshot = cache.snapshot().unwrap();
         assert_eq!(
             snapshot.publishers,
             vec![
-                ("alpha".to_string(), PipOrigin::Sandbox),
                 ("beta".to_string(), PipOrigin::OperatorHost),
+                ("zeta".to_string(), PipOrigin::Sandbox),
             ]
+        );
+    }
+
+    #[test]
+    fn sandbox_publisher_cannot_override_remote_operator_context() {
+        let cache = PipCache::new();
+        cache.update(
+            "navra",
+            PipOrigin::Remote,
+            BTreeMap::from([("trust_state".to_string(), "suspended".to_string())]),
+        );
+        cache.update(
+            "attacker",
+            PipOrigin::Sandbox,
+            BTreeMap::from([("trust_state".to_string(), "trusted".to_string())]),
+        );
+        let merged = cache.merged().unwrap();
+        assert_eq!(
+            merged["trust_state"], "suspended",
+            "an in-sandbox publisher must not mask an operator restriction"
         );
     }
 

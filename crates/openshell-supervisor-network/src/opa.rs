@@ -177,8 +177,27 @@ fn emit_binary_identity_mode(require_binary_identity: bool, source: &str) {
 /// published property to an allow decision, letting a compromised in-sandbox
 /// publisher expand egress beyond the baseline allowlist. Authors express PIP
 /// denials with the authored `pip_deny_rules` network policy field instead.
+///
+/// The check is best-effort: it matches the common spellings of a reference
+/// to `input.pip` (dotted, indexed, spaced, and `object.get` on `input`) so
+/// accidental allow-side use is caught, but Rego is Turing-complete enough
+/// that a deliberately obfuscated reference (for example binding `input` to
+/// a local variable first) can still evade it. Operator-supplied Rego is
+/// already trusted configuration; this guard is a tripwire, not a sandbox
+/// boundary.
 fn validate_no_pip_input_reference(policy: &str, source: &str) -> Result<()> {
-    if policy != BAKED_POLICY_RULES && policy.contains("input.pip") {
+    const PIP_REFERENCE_PATTERNS: &[&str] = &[
+        "input.pip",
+        "input . pip",
+        "input[\"pip\"]",
+        "input['pip']",
+        "object.get(input",
+    ];
+    if policy != BAKED_POLICY_RULES
+        && PIP_REFERENCE_PATTERNS
+            .iter()
+            .any(|pattern| policy.contains(pattern))
+    {
         return Err(miette::miette!(
             "custom {source} policy may not reference input.pip: PIP context is deny-only. \
              Express PIP denials with the authored pip_deny_rules network policy field"
@@ -4486,6 +4505,17 @@ network_policies:
             error.to_string().contains("deny-only"),
             "error must explain the deny-only constraint, got: {error}"
         );
+        // Alternate spellings of the same reference are also rejected.
+        for hostile in [
+            "package p\nallow_network if { input[\"pip\"].trust_state == \"trusted\" }\n",
+            "package p\nallow_network if { input . pip . trust_state == \"trusted\" }\n",
+            "package p\nallow_network if { object.get(input, \"pip\", {}).trust_state == \"trusted\" }\n",
+        ] {
+            let Err(error) = OpaEngine::from_strings(hostile, "network_policies: {}\n") else {
+                panic!("alternate input.pip spelling must be rejected: {hostile}")
+            };
+            assert!(error.to_string().contains("deny-only"), "{error}");
+        }
         // The baked policy itself loads unchanged.
         assert!(OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").is_ok());
     }

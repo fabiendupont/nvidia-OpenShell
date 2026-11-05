@@ -1503,6 +1503,15 @@ fn validate_sandbox_policy_with_mcp_presence(
                     rule_index,
                     reason: "must set both key and equals".to_string(),
                 });
+            } else if pip.key.trim() != pip.key {
+                // A padded key is compared exactly against published
+                // properties, so the rule could never fire; reject it rather
+                // than accept a deny that silently does not apply.
+                violations.push(PolicyViolation::InvalidPipDenyRule {
+                    policy_name: name.clone(),
+                    rule_index,
+                    reason: "key must not have leading or trailing whitespace".to_string(),
+                });
             }
         }
         for (endpoint_index, ep) in rule.endpoints.iter().enumerate() {
@@ -5042,6 +5051,30 @@ network_policies:
                 .iter()
                 .any(|violation| matches!(violation, PolicyViolation::InvalidPipDenyRule { .. })),
             "expected an InvalidPipDenyRule violation, got: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_padded_pip_deny_key() {
+        let yaml = r#"
+version: 1
+network_policies:
+  test:
+    endpoints:
+      - host: example.com
+        port: 443
+    pip_deny_rules:
+      - key: " trust_state"
+        equals: suspended
+"#;
+        let policy = parse_sandbox_policy(yaml).expect("serde accepts the shape");
+        let violations = validate_sandbox_policy(&policy).expect_err("padded key must fail");
+        assert!(
+            violations.iter().any(|violation| matches!(
+                violation,
+                PolicyViolation::InvalidPipDenyRule { reason, .. } if reason.contains("whitespace")
+            )),
+            "expected a whitespace InvalidPipDenyRule violation, got: {violations:?}"
         );
     }
 

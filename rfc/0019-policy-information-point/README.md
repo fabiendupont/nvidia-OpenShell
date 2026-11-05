@@ -49,7 +49,9 @@ The sandbox is an untrusted environment. We do not accept unsolicited connection
 
 The governance framework exposes a gRPC service on a Unix domain socket at a well-known path. The supervisor discovers the socket, verifies the owning binary's identity via `SO_PEERCRED` and SHA256 hash check (the same `/proc`-based resolution the proxy already uses for binary identity), and initiates a streaming RPC. The governance framework sends its current security context and pushes updates as the context changes. The supervisor caches the latest state.
 
-If the binary hash does not match the TOFU cache, the supervisor logs a warning and does not connect. If the stream disconnects, the cached context reverts to null. Both behaviors are fail-closed.
+If the binary hash does not match the TOFU cache, the supervisor logs a warning and does not connect. If the stream disconnects, the cached context reverts to null. Both behaviors fail closed with respect to the *trustworthiness of the context*: a mismatched or vanished publisher never keeps contributing values the operator did not verify.
+
+This is deliberately fail-open with respect to a *PIP restriction*: when a publisher that reported `data_classification: phi` disconnects, its restriction no longer applies and the baseline allowlist governs the connection again. A PIP is an additional deny signal layered on top of the allowlist, not a mandatory gate — the non-goal that a disconnected or empty publisher is equivalent to no publisher requires exactly this. The security limit is therefore explicit: PIP restrictions hold only while their publisher is connected and publishing. Operators who need a restriction to survive publisher loss must express it in the baseline allowlist (remove the endpoint), not in a PIP rule. Stale context is never retained silently; losing the restriction is at least observable through the disconnect and OCSF origin tagging.
 
 ### Publisher classes
 

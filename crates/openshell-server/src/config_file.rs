@@ -1209,11 +1209,12 @@ impl TryFrom<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
             Some(path) => {
                 let pem =
                     std::fs::read(path).map_err(|source| ConfigFileError::MiddlewareTlsCaRead {
+                        kind: "middleware",
                         name: config.name.clone(),
                         path: path.clone(),
                         source,
                     })?;
-                sanitize_ca_cert_pem(&config.name, path, &pem)?
+                sanitize_ca_cert_pem("middleware", &config.name, path, &pem)?
             }
             None => Vec::new(),
         };
@@ -1298,11 +1299,12 @@ impl TryFrom<&PipServiceFileConfig> for SupervisorPipService {
             Some(path) => {
                 let pem =
                     std::fs::read(path).map_err(|source| ConfigFileError::MiddlewareTlsCaRead {
+                        kind: "pip",
                         name: config.name.clone(),
                         path: path.clone(),
                         source,
                     })?;
-                sanitize_ca_cert_pem(&config.name, path, &pem)?
+                sanitize_ca_cert_pem("pip", &config.name, path, &pem)?
             }
             None => Vec::new(),
         };
@@ -1323,17 +1325,24 @@ impl TryFrom<&PipServiceFileConfig> for SupervisorPipService {
     }
 }
 
-fn sanitize_ca_cert_pem(name: &str, path: &Path, pem: &[u8]) -> Result<Vec<u8>, ConfigFileError> {
+fn sanitize_ca_cert_pem(
+    kind: &'static str,
+    name: &str,
+    path: &Path,
+    pem: &[u8],
+) -> Result<Vec<u8>, ConfigFileError> {
     let mut sanitized = Vec::new();
     let mut certificate_count = 0;
     for item in <(SectionKind, Vec<u8>)>::pem_slice_iter(pem) {
         let item = item.map_err(|source| ConfigFileError::MiddlewareTlsCaInvalid {
+            kind,
             name: name.to_string(),
             path: path.to_path_buf(),
             message: source.to_string(),
         })?;
         let (SectionKind::Certificate, certificate) = item else {
             return Err(ConfigFileError::MiddlewareTlsCaInvalid {
+                kind,
                 name: name.to_string(),
                 path: path.to_path_buf(),
                 message: "PEM bundle contains a non-certificate block".to_string(),
@@ -1350,6 +1359,7 @@ fn sanitize_ca_cert_pem(name: &str, path: &Path, pem: &[u8]) -> Result<Vec<u8>, 
     }
     if certificate_count == 0 {
         return Err(ConfigFileError::MiddlewareTlsCaInvalid {
+            kind,
             name: name.to_string(),
             path: path.to_path_buf(),
             message: "PEM bundle does not contain a certificate".to_string(),
@@ -1398,20 +1408,22 @@ pub enum ConfigFileError {
     #[error("invalid gateway config field `openshell.drivers.{name}.isolation_backend`: {message}")]
     InvalidIsolationBackend { name: String, message: &'static str },
     #[error(
-        "failed to read TLS CA certificate for supervisor middleware '{name}' from '{}': {source}",
+        "failed to read TLS CA certificate for supervisor {kind} '{name}' from '{}': {source}",
         path.display()
     )]
     MiddlewareTlsCaRead {
+        kind: &'static str,
         name: String,
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
     #[error(
-        "invalid TLS CA certificate for supervisor middleware '{name}' at '{}': {message}",
+        "invalid TLS CA certificate for supervisor {kind} '{name}' at '{}': {message}",
         path.display()
     )]
     MiddlewareTlsCaInvalid {
+        kind: &'static str,
         name: String,
         path: PathBuf,
         message: String,

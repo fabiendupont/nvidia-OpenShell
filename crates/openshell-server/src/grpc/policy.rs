@@ -3064,6 +3064,7 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
         &settings,
         policy_source,
         &supervisor_middleware_services,
+        &state.config.pip_services,
         state.config.policy_validation_failure_mode,
         state.extension_jwt_issuer.is_some(),
     );
@@ -6957,6 +6958,7 @@ fn compute_config_revision_with_validation_mode(
     settings: &HashMap<String, EffectiveSetting>,
     policy_source: PolicySource,
     supervisor_middleware_services: &[openshell_core::proto::SupervisorMiddlewareService],
+    supervisor_pip_services: &[openshell_core::proto::SupervisorPipService],
     policy_validation_failure_mode: openshell_core::PolicyValidationFailureMode,
     extension_authentication_enabled: bool,
 ) -> u64 {
@@ -6998,6 +7000,15 @@ fn compute_config_revision_with_validation_mode(
     for service in middleware {
         hasher.update(service.encode_to_vec());
     }
+    // Remote PIP publishers are part of the delivered configuration; a
+    // registration change must move the revision even when the policy and
+    // settings are unchanged, or an admission report for the old publisher
+    // set would be accepted.
+    let mut pip: Vec<_> = supervisor_pip_services.to_vec();
+    pip.sort_by(|left, right| left.name.cmp(&right.name));
+    for service in pip {
+        hasher.update(service.encode_to_vec());
+    }
 
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 8];
@@ -7017,6 +7028,7 @@ fn compute_config_revision(
         settings,
         policy_source,
         supervisor_middleware_services,
+        &[],
         openshell_core::PolicyValidationFailureMode::default(),
         false,
     )
@@ -23481,6 +23493,38 @@ mod tests {
     }
 
     #[test]
+    fn config_revision_changes_when_pip_services_change() {
+        let policy = ProtoSandboxPolicy::default();
+        let settings = HashMap::new();
+        let base = compute_config_revision_with_validation_mode(
+            Some(&policy),
+            &settings,
+            PolicySource::Sandbox,
+            &[],
+            &[],
+            openshell_core::PolicyValidationFailureMode::default(),
+            false,
+        );
+        let with_pip = compute_config_revision_with_validation_mode(
+            Some(&policy),
+            &settings,
+            PolicySource::Sandbox,
+            &[],
+            &[openshell_core::proto::SupervisorPipService {
+                name: "navra".to_string(),
+                grpc_endpoint: "https://navra.internal:50051".to_string(),
+                ..Default::default()
+            }],
+            openshell_core::PolicyValidationFailureMode::default(),
+            false,
+        );
+        assert_ne!(
+            base, with_pip,
+            "a PIP registration change must move the configuration revision"
+        );
+    }
+
+    #[test]
     fn config_revision_changes_when_validation_failure_mode_changes() {
         let policy = ProtoSandboxPolicy::default();
         let settings = HashMap::new();
@@ -23490,6 +23534,7 @@ mod tests {
             &settings,
             PolicySource::Sandbox,
             &[],
+            &[],
             openshell_core::PolicyValidationFailureMode::FailClosed,
             false,
         );
@@ -23497,6 +23542,7 @@ mod tests {
             Some(&policy),
             &settings,
             PolicySource::Sandbox,
+            &[],
             &[],
             openshell_core::PolicyValidationFailureMode::RetainLastValid,
             false,
@@ -23514,6 +23560,7 @@ mod tests {
             &settings,
             PolicySource::Sandbox,
             &[],
+            &[],
             openshell_core::PolicyValidationFailureMode::FailClosed,
             false,
         );
@@ -23521,6 +23568,7 @@ mod tests {
             Some(&policy),
             &settings,
             PolicySource::Sandbox,
+            &[],
             &[],
             openshell_core::PolicyValidationFailureMode::FailClosed,
             true,
