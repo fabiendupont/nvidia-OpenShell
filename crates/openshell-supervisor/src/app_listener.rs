@@ -1079,6 +1079,7 @@ mod tests {
     fn installed(routes: Vec<SandboxServiceRoute>) -> SettingsPollResult {
         SettingsPollResult {
             service_routes: routes,
+            supervisor_pip_services: Vec::new(),
             settings_revision: 1,
             configuration_instance_id: "runtime-a".into(),
             configuration_admitted: true,
