@@ -1650,7 +1650,7 @@ fn emit_transparent_policy_denial(
         .firewall_rule("-", "opa")
         .message(format!("Transparent TCP denied {host}:{port}"))
         .status_detail(status_detail);
-    ocsf_emit!(with_pip_denial_tags(builder, decision).build());
+    egress_emit!(with_pip_denial_tags(builder, decision).build());
 }
 
 /// Tag a network denial event with the published PIP context and each

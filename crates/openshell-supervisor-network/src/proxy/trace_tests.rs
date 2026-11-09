@@ -110,6 +110,8 @@ async fn forward_denials_use_the_saved_connect_parent() {
                 binary_pid: None,
                 ancestors: vec![],
                 cmdline_paths: vec![],
+                pip: None,
+                pip_influenced: false,
             };
             let denial = DestinationDenial {
                 kind: DestinationDenialKind::InternalAddress,

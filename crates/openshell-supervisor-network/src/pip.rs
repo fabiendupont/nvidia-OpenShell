@@ -887,7 +887,7 @@ fn verify_publisher_identity(
                     exe = %exe.display(),
                     "PIP publisher binary hash failed TOFU verification; not connecting"
                 );
-                openshell_ocsf::ocsf_emit!(
+                crate::telemetry::egress_emit!(
                     openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
                         .severity(openshell_ocsf::SeverityId::High)
                         .finding_info(openshell_ocsf::FindingInfo::new(
